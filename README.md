@@ -249,7 +249,7 @@ every other device forwards untouched.
 | Right stick | Look | relative mouse |
 | A / B | Primary / secondary action | LMB / RMB |
 | X / Y | Use object / buddy | `Q` / `E` |
-| LB / RB | Look mode / center view | `LShift` / `C` |
+| LB / RB | Photo mode / center view | `LShift` / `C` |
 | LT / RT | Crouch / run · accelerate | `LCtrl` / `Space` |
 | Start / Back | Menu / map | `Esc` / `Tab` |
 | D-pad ←→ | Inventory prev / next | `2` / `3` |

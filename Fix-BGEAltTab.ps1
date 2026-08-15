@@ -619,7 +619,7 @@ function Install-ControllerSupport {
                 'B=MOUSE2                ; secondary action',
                 'X=0x10                  ; Q - use object',
                 'Y=0x12                  ; E - buddy / compass',
-                'LB=0x2A                 ; LShift - look mode',
+                'LB=0x2A                 ; LShift - photo/camera mode (registry calls it "Look mode")',
                 'RB=0x2E                 ; C - center view',
                 'LT=0x1D                 ; LCtrl - crouch',
                 'RT=0x39                 ; Space - run / accelerate',
