@@ -39,6 +39,10 @@
 
 #define PTRV(p) ((unsigned)(UINT_PTR)(p))
 
+/* Lets the installer recognise this DLL as one of ours across rebuilds. See the note in
+ * d3d9_windowed.cpp. Referenced from DllMain so it is not optimised out. */
+static const char kProxyMarker[] = "BGEFIX_PROXY_V1";
+
 /* ------------------------------------------------------------------ DirectInput types */
 
 /* Declared locally so no DirectX SDK headers are required. */
@@ -662,6 +666,7 @@ LPCVOID WINAPI GetdfDIJoystick(void)
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 {
     if (reason == DLL_PROCESS_ATTACH) {
+        if (kProxyMarker[0] == 0) return FALSE;   /* keeps the marker in the binary */
         g_self = (HMODULE)inst;
         DisableThreadLibraryCalls(inst);
         InitializeCriticalSection(&g_lock);

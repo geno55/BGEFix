@@ -116,6 +116,7 @@ powershell -ExecutionPolicy Bypass -File .\Fix-BGEAltTab.ps1 -Revert
 | `-PadDeadzone <0-32000>` | `8000` | Stick deadzone in raw XInput units. |
 | `-PadInvertLook` | — | Invert the right stick's vertical axis. |
 | `-PadPath <path>` | `dist\dinput8.dll` | Prebuilt controller proxy to install. |
+| `-ResetConfig` | — | Regenerate the `.ini` files. Without it, existing configs are preserved. |
 | `-NoShortcut` | — | Skip the launcher. **Leaves you with no affinity pinning at all.** |
 | `-NoWindowedProxy` | — | Skip the proxy. **Leaves the game in exclusive fullscreen.** |
 | `-NoElevate` | — | Error out instead of prompting for elevation. |
@@ -288,7 +289,25 @@ or use the ADK route below.)
 
 **Reinstalling the game restores the shim.** GOG's installer gates the shim install behind
 a `DoSDBOnce1207658746=1` flag in `goglog.ini`. A fresh install or a repair can re-register
-it. Just re-run this script; it is idempotent.
+it. Just re-run this script — see below.
+
+## Idempotency
+
+Re-running is safe and is the supported way to repair or upgrade an install. Specifically:
+
+- Removing the shim is skipped when it is already gone.
+- The launcher shortcut is rewritten in place.
+- A proxy already installed is replaced by the current build. Our DLLs carry an embedded
+  marker (`BGEFIX_PROXY_V1`), so an upgraded build recognises an older build of itself
+  rather than mistaking it for a third-party wrapper and chaining to it.
+- A third-party DLL that was chained on a previous run stays chained, and is re-recorded
+  each run so `-Revert` can always put it back.
+- **Your `.ini` files are never overwritten.** Once a config exists it is left alone, so
+  remapping survives every re-run. Use `-ResetConfig` to regenerate from the defaults.
+
+The one state that is deliberately *not* auto-resolved: if both `d3d9.dll` and
+`d3d9_chain.dll` (or the `dinput8` pair) exist and the first is not ours, the installer
+refuses rather than guess which to keep.
 
 **Only databases containing `IgnoreAltTab` are removed.** If a database is registered for
 `BGE.exe` that the script cannot identify, it refuses to touch it rather than guessing.

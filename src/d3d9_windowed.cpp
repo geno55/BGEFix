@@ -41,6 +41,12 @@
  * through this cast, which is exact because the DLL is 32-bit by construction. */
 #define PTRV(p) ((unsigned)(UINT_PTR)(p))
 
+/* Lets the installer recognise this DLL as one of ours across rebuilds. Identifying it
+ * by file hash instead would make an upgraded build look third-party, and the installer
+ * would chain the new proxy to the old one. Referenced from DllMain so it is not
+ * optimised out of the binary. */
+static const char kProxyMarker[] = "BGEFIX_PROXY_V1";
+
 /* ------------------------------------------------------------------ D3D types */
 
 /* Exact layout of D3DPRESENT_PARAMETERS: 14 fields, all 4 bytes on x86. */
@@ -483,6 +489,7 @@ DWORD WINAPI D3DPERF_GetStatus(void)
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 {
     if (reason == DLL_PROCESS_ATTACH) {
+        if (kProxyMarker[0] == 0) return FALSE;   /* keeps the marker in the binary */
         g_self = (HMODULE)inst;
         DisableThreadLibraryCalls(inst);
         InitializeCriticalSection(&g_lock);

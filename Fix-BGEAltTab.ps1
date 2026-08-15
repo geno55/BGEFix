@@ -73,6 +73,11 @@
 .PARAMETER PadInvertLook
     Invert the right stick's vertical look axis.
 
+.PARAMETER ResetConfig
+    Regenerate d3d9_windowed.ini and dinput8_xinput.ini from the current options.
+    Without this, an existing config is left alone so re-running never discards your
+    remapping.
+
 .PARAMETER NoElevate
     Fail with an error instead of relaunching elevated when not running as admin.
 
@@ -121,6 +126,7 @@ param(
     [ValidateRange(0, 32000)]
     [int]      $PadDeadzone = 8000,
     [switch]   $PadInvertLook,
+    [switch]   $ResetConfig,
     [switch]   $NoElevate,
     [switch]   $Force
 )
@@ -149,6 +155,10 @@ $script:InstalledKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCo
 # Documented launch chain. Affinity set on the first present entry is inherited
 # by everything it spawns.
 $script:LaunchChain  = @('CheckApplication.exe', 'run.exe', 'BGE.exe')
+
+# Embedded in dist\d3d9.dll and dist\dinput8.dll by src\*.cpp. Used to tell our own
+# proxies apart from third-party wrappers across rebuilds.
+$script:ProxyMarker  = 'BGEFIX_PROXY_V1'
 
 #endregion
 
@@ -445,6 +455,24 @@ function Test-Pe32 {
     catch { return $false }
 }
 
+function Test-IsOurProxy {
+    # Our proxy DLLs embed a marker string so the installer can recognise any build of
+    # itself. Matching on file hash would break the moment the proxy is rebuilt.
+    param([string]$Path)
+
+    # Guard an empty marker: every string contains "", which would classify a
+    # third-party DLL as ours and overwrite it without a backup.
+    if ([string]::IsNullOrEmpty($script:ProxyMarker)) {
+        throw 'Internal error: proxy marker is not set. Refusing to classify DLLs.'
+    }
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($Path)
+        $text  = [System.Text.Encoding]::ASCII.GetString($bytes)
+        return $text.Contains($script:ProxyMarker)
+    }
+    catch { return $false }
+}
+
 function Install-ProxyDll {
     <#
         Shared installer for the in-repo proxy DLLs (d3d9.dll and dinput8.dll).
@@ -472,33 +500,41 @@ function Install-ProxyDll {
         throw "$Source is not a 32-bit DLL. BGE.exe is a 32-bit process and cannot load it. Rebuild with src\build.cmd."
     }
 
-    $target  = Join-Path $Folder $TargetName
-    $chained = ''
+    $target      = Join-Path $Folder $TargetName
+    $chainTarget = Join-Path $Folder $ChainName
 
     if (Test-Path -LiteralPath $target) {
-        $have = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
-        $ours = (Get-FileHash -LiteralPath $Source -Algorithm SHA256).Hash
-
-        if ($have -ne $ours) {
-            $chainTarget = Join-Path $Folder $ChainName
+        # Identify our own DLL by its embedded marker, not by hashing against the source.
+        # A rebuilt proxy has different bytes, and a hash check would classify the
+        # already-installed copy as third-party and chain the new build to the old one.
+        if (-not (Test-IsOurProxy -Path $target)) {
             if (Test-Path -LiteralPath $chainTarget) {
                 throw ("Both $TargetName and $ChainName already exist in the game folder. " +
                        "Resolve that by hand so nothing is lost, then re-run.")
             }
             Backup-File -Path $target -Label "$TargetName-preexisting" | Out-Null
             Move-Item -LiteralPath $target -Destination $chainTarget -Force
-            $chained = $chainTarget
             Write-Ok "Existing $TargetName renamed to $ChainName; the proxy will forward to it"
         }
     }
 
     Copy-Item -LiteralPath $Source -Destination $target -Force
 
+    # Report the chain from what is on disk rather than from what this run happened to do,
+    # so a second run still records it and -Revert can put it back.
+    $chained = ''
+    if (Test-Path -LiteralPath $chainTarget) { $chained = $chainTarget }
+
     $ini = Join-Path $Folder $IniName
-    [System.IO.File]::WriteAllLines($ini, $IniLines, (New-Object System.Text.UTF8Encoding($false)))
+    if ((Test-Path -LiteralPath $ini) -and -not $ResetConfig) {
+        Write-Info "$IniName exists - keeping your settings (use -ResetConfig to regenerate)"
+    }
+    else {
+        [System.IO.File]::WriteAllLines($ini, $IniLines, (New-Object System.Text.UTF8Encoding($false)))
+        Write-Info "config      -> $ini"
+    }
 
     Write-Info "$TargetName -> $target"
-    Write-Info "config      -> $ini"
 
     return [pscustomobject]@{ Target = $target; Ini = $ini; Chained = $chained }
 }
