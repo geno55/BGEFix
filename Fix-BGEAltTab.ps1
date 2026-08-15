@@ -64,11 +64,21 @@
 .PARAMETER PadPath
     Path to a prebuilt dinput8 proxy. Defaults to dist\dinput8.dll beside this script.
 
-.PARAMETER PadLookSensitivity
-    Right-stick look speed, 1-200. Default 30.
+.PARAMETER PadLookSpeed
+    Right-stick look speed in mouse counts per second at full deflection, 100-20000.
+    Default 1800. This is a real unit: the camera turns at the same rate whatever
+    frame rate the game runs at.
+
+    Replaces -PadLookSensitivity, which was counts per *poll* and so meant something
+    different on every machine. Use -ResetConfig to rewrite an older ini.
 
 .PARAMETER PadDeadzone
-    Stick deadzone in raw XInput units, 0-32000. Default 8000.
+    Left-stick deadzone in raw XInput units, 0-32000. Default 7849, XInput's own
+    recommended value. Applied radially, so the dead region is a circle.
+
+.PARAMETER PadLookDeadzone
+    Right-stick deadzone in raw XInput units, 0-32000. Default 8689, XInput's own
+    recommended value for the right stick.
 
 .PARAMETER PadInvertLook
     Invert the right stick's vertical look axis.
@@ -121,10 +131,12 @@ param(
     [int]      $WindowMode = 1,
     [switch]   $InstallControllerSupport,
     [string]   $PadPath,
-    [ValidateRange(1, 200)]
-    [int]      $PadLookSensitivity = 30,
+    [ValidateRange(100, 20000)]
+    [int]      $PadLookSpeed = 1800,
     [ValidateRange(0, 32000)]
-    [int]      $PadDeadzone = 8000,
+    [int]      $PadDeadzone = 7849,
+    [ValidateRange(0, 32000)]
+    [int]      $PadLookDeadzone = 8689,
     [switch]   $PadInvertLook,
     [switch]   $ResetConfig,
     [switch]   $NoElevate,
@@ -631,16 +643,16 @@ function Install-ControllerSupport {
                 'DPadDown=0',
                 'DPadLeft=0x03           ; 2 - inventory prev',
                 'DPadRight=0x04          ; 3 - inventory next',
-                'TriggerThreshold=60',
+                'TriggerThreshold=30      ; XINPUT_GAMEPAD_TRIGGER_THRESHOLD',
                 '',
                 '[Sticks]',
                 'LeftUp=0x11             ; W',
                 'LeftDown=0x1F           ; S',
                 'LeftLeft=0x1E           ; A',
                 'LeftRight=0x20          ; D',
-                "Deadzone=$PadDeadzone",
-                "LookDeadzone=$PadDeadzone",
-                "LookSensitivity=$PadLookSensitivity",
+                "Deadzone=$PadDeadzone         ; radial, in raw XInput units",
+                "LookDeadzone=$PadLookDeadzone",
+                "LookSpeed=$PadLookSpeed          ; mouse counts per second at full deflection",
                 "InvertLook=$([int]$PadInvertLook.IsPresent)",
                 '',
                 '[General]',
@@ -648,7 +660,7 @@ function Install-ControllerSupport {
                 'Chain=dinput8_chain.dll'
             )
     if ($r) {
-        Write-Ok "Controller support installed (look sensitivity $PadLookSensitivity, deadzone $PadDeadzone)"
+        Write-Ok "Controller support installed (look $PadLookSpeed counts/sec, deadzone $PadDeadzone/$PadLookDeadzone)"
         Write-Info 'Left stick moves, right stick looks, A = primary action. Remap in dinput8_xinput.ini.'
     }
     return $r

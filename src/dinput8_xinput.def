@@ -1,6 +1,16 @@
-; Undecorated exports a dinput8 client expects. BGE.exe imports only
-; DirectInput8Create, but the COM entry points are forwarded too so the DLL is a
-; drop-in replacement for anything else that loads it.
+; Undecorated exports a dinput8 client expects. BGE.exe imports only DirectInput8Create;
+; the COM entry points are forwarded so that another client loading this DLL still finds
+; a complete export table and keeps working.
+;
+; Scope, stated plainly: the FORWARDING is general, the INJECTION is tuned for BGE. In
+; particular, synthetic buffered events are numbered by anchoring to the highest real
+; DirectInput sequence number seen (see PadSeqNext in pad_support.h) because there is no
+; API to read DirectInput's counter directly. That is correct against every event already
+; delivered, but a long burst of injected events with no real input in between can run
+; ahead of a real event that arrives afterwards. An application that depends on exact
+; cross-device ordering under DISEQUENCE_COMPARE should not assume this DLL is
+; transparent. Treat it as a BGE shim that behaves itself, not as a general-purpose
+; dinput8 replacement.
 LIBRARY dinput8
 EXPORTS
     DirectInput8Create

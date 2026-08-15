@@ -24,6 +24,33 @@
  * device wrapper whose GetDeviceState (immediate mode) and GetDeviceData (buffered mode)
  * merge in state derived from XInput. Everything else forwards untouched.
  *
+ * Input model
+ * -----------
+ * The keyboard and mouse wrappers are two objects that must agree about one controller,
+ * so the pad is read into a single immutable PadSample:
+ *
+ *   Shared, under g_padLock   one PadSample, copied out by value. A sample is reused for
+ *                             2 ms, so both devices polled in the same frame see the same
+ *                             instant instead of each re-reading XInput separately.
+ *   Per device wrapper        edge-detection buffer, look carry, last-look timestamp.
+ *                             Nothing else is shared, so nothing else can race.
+ *
+ * Look is a velocity, not a delta. RebuildSample stores the right stick as -1..1 and the
+ * mouse wrapper multiplies by LookSpeed (counts per second) and by the time actually
+ * elapsed since it last reported motion, measured with QueryPerformanceCounter. Adding a
+ * fixed delta per poll instead makes the camera's speed depend on how often the game
+ * polls: the same setting turned 2.4x faster at 144 Hz than at 60 Hz.
+ *
+ * Finding the pad is throttled. XInputGetState on an empty slot is a documented slow
+ * path, so the connected user index is remembered and a poll costs one call; all four
+ * slots are only swept when nothing is connected or the current pad is idle, and then at
+ * most every two seconds. Sweeping 0..3 on every poll cost an unplugged machine around
+ * 1150 slow calls a second at 144 Hz, in a game pinned to one core for timing.
+ *
+ * Stick shaping and the scan policy live in pad_support.h so the tests can assert on
+ * them without a controller attached. See that file for why the deadzone is radial and
+ * rescaled.
+ *
  * How the interfaces are modelled
  * -------------------------------
  * dinput.h and xinput.h both ship with the Windows SDK, so the interfaces, the device
@@ -53,6 +80,7 @@
 #include <dinput.h>
 #include <xinput.h>
 #include <stdarg.h>
+#include "pad_support.h"
 #include <new>
 
 #define PTRV(p) ((unsigned)(UINT_PTR)(p))
@@ -73,26 +101,87 @@ typedef DWORD (WINAPI *PFN_XInputGetState)(DWORD, XINPUT_STATE*);
 
 static HMODULE g_self = NULL, g_chain = NULL, g_xinput = NULL;
 static PFN_XInputGetState g_XInputGetState = NULL;
-static CRITICAL_SECTION g_lock;
-static BOOL g_lockReady = FALSE;
+
+/* Two locks, each with one job. g_modLock covers lazy module loading (the chain DLL and
+ * the XInput runtime); g_padLock covers the pad sample and the settings it is built
+ * from. Lock order is pad -> module; nothing ever takes them the other way round. */
+static CRITICAL_SECTION g_modLock;
+static CRITICAL_SECTION g_padLock;
+static BOOL g_locksReady = FALSE;
+
 static BOOL g_log = FALSE;
 static wchar_t g_ini[MAX_PATH] = {0}, g_logPath[MAX_PATH] = {0};
 
-/* mapping */
+/* Settings. Written by LoadConfig and read by RebuildSample, both under g_padLock. */
 static int  g_mA, g_mB, g_mX, g_mY, g_mLB, g_mRB, g_mLT, g_mRT;
 static int  g_mStart, g_mBack, g_mLS, g_mRS;
 static int  g_mDU, g_mDD, g_mDL, g_mDR;
 static int  g_sUp, g_sDown, g_sLeft, g_sRight;
-static int  g_deadzone = 8000, g_lookDeadzone = 8000, g_lookSens = 30, g_invertLook = 0;
-static int  g_triggerThreshold = 60;
+static int  g_deadzone          = XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE;
+static int  g_lookDeadzone      = XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE;
+static int  g_triggerThreshold  = XINPUT_GAMEPAD_TRIGGER_THRESHOLD;
+static int  g_lookSpeed         = 1800;   /* mouse counts per second at full deflection */
+static int  g_invertLook        = 0;
 
-/* injected state, rebuilt each poll */
-static BYTE g_keys[256];
-static BYTE g_prevKeys[256];
-static BYTE g_mouseBtn[8];
-static BYTE g_prevMouseBtn[8];
-static LONG g_lookX = 0, g_lookY = 0;
-static DWORD g_seq = 1;
+/* One sample of the pad at one instant.
+ *
+ * This is the ONLY mutable state shared between the keyboard and mouse wrappers, and
+ * every read and write of it happens under g_padLock. It is copied out by value, so a
+ * caller works on a private snapshot and cannot see another device's rebuild in
+ * progress. The previous design had both wrappers memset and refill a set of globals
+ * with no lock at all: one device's clear was another device's read.
+ *
+ * lookX/lookY are a VELOCITY in -1..1, not a per-poll delta. Turning that into mouse
+ * counts is the mouse wrapper's job, because only it knows how much time has passed
+ * since it last reported motion. */
+typedef struct {
+    BYTE     keys[256];      /* DIK scan codes to force down */
+    BYTE     mouseBtn[8];
+    double   lookX, lookY;
+    LONGLONG taken;          /* QPC stamp; 0 = never sampled */
+} PadSample;
+
+static PadSample g_pad;
+static LONGLONG  g_qpcFreq = 0;
+/* Buffered-event sequence numbering, under g_padLock. g_seqAnchor is the highest real
+ * DirectInput sequence number seen on either wrapped device; g_seqLast is the last
+ * synthetic number we issued. See PadSeqNext in pad_support.h. */
+static DWORD     g_seqAnchor = 0;
+static DWORD     g_seqLast   = 0;
+
+/* How long a sample stays fresh. Any device polled inside this window sees the SAME
+ * instant of controller state, so the keyboard events and the mouse events the game
+ * collects in one frame agree with each other. Well under a frame at any refresh rate,
+ * so this never shows up as input lag. */
+static const double kSampleMaxAgeSec = 0.002;
+
+/* An unusually long gap between mouse reads - a menu, an alt-tab, a debugger - must not
+ * be converted into one enormous camera jump. */
+static const double kMaxLookStepSec = 0.25;
+
+/* How often we may go looking for a controller. Long enough that an unplugged machine
+ * pays almost nothing, short enough that plugging a pad in feels immediate. */
+static const double kRescanSec = 2.0;
+
+/* The XInput user index currently being read, or -1 if none is known connected, and when
+ * we last swept all four slots. Both live under g_padLock. */
+static int      g_padIndex = -1;
+static LONGLONG g_lastScan = 0;
+
+/* ------------------------------------------------------------------ time base */
+
+static LONGLONG Now(void)
+{
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return t.QuadPart;
+}
+
+static double SecondsSince(LONGLONG then, LONGLONG now)
+{
+    if (g_qpcFreq <= 0 || then <= 0 || now <= then) return 0.0;
+    return (double)(now - then) / (double)g_qpcFreq;
+}
 
 /* ------------------------------------------------------------------ logging */
 
@@ -167,9 +256,18 @@ static void BuildPaths(void)
     lstrcpynW(g_logPath, p, MAX_PATH); lstrcatW(g_logPath, L"dinput8_xinput.log");
 }
 
+static int ClampInt(int v, int lo, int hi)
+{
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+/* Takes g_padLock: these values are read while building a sample. */
 static void LoadConfig(void)
 {
     if (!g_ini[0]) return;
+    if (g_locksReady) EnterCriticalSection(&g_padLock);
 
     /* Defaults follow the game's own bindings, decoded from
      * HKCU\Software\Ubisoft\Beyond Good & Evil\...\Key bindings. */
@@ -195,12 +293,28 @@ static void LoadConfig(void)
     g_sLeft  = ReadStick(L"LeftLeft",  L"0x1E"); /* A */
     g_sRight = ReadStick(L"LeftRight", L"0x20"); /* D */
 
-    g_deadzone         = (int)GetPrivateProfileIntW(L"Sticks", L"Deadzone",        8000, g_ini);
-    g_lookDeadzone     = (int)GetPrivateProfileIntW(L"Sticks", L"LookDeadzone",    8000, g_ini);
-    g_lookSens         = (int)GetPrivateProfileIntW(L"Sticks", L"LookSensitivity",   30, g_ini);
-    g_invertLook       = (int)GetPrivateProfileIntW(L"Sticks", L"InvertLook",         0, g_ini);
-    g_triggerThreshold = (int)GetPrivateProfileIntW(L"Buttons", L"TriggerThreshold",  60, g_ini);
-    g_log              = GetPrivateProfileIntW(L"General", L"Log", 0, g_ini) != 0;
+    /* Deadzone and trigger defaults are XInput's own recommended values from xinput.h
+     * rather than numbers picked here. Clamped so a hand-edited ini cannot reach the
+     * deadzone == full-scale division in ApplyDeadzone. */
+    g_deadzone     = ClampInt((int)GetPrivateProfileIntW(L"Sticks", L"Deadzone",
+                              XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE, g_ini), 0, 32000);
+    g_lookDeadzone = ClampInt((int)GetPrivateProfileIntW(L"Sticks", L"LookDeadzone",
+                              XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE, g_ini), 0, 32000);
+    g_triggerThreshold = ClampInt((int)GetPrivateProfileIntW(L"Buttons", L"TriggerThreshold",
+                              XINPUT_GAMEPAD_TRIGGER_THRESHOLD, g_ini), 0, 254);
+    g_invertLook   = (int)GetPrivateProfileIntW(L"Sticks", L"InvertLook", 0, g_ini);
+
+    /* LookSpeed is mouse counts per second at full stick deflection - a real unit, the
+     * same on every machine. It replaces LookSensitivity, which was counts per *poll*:
+     * motion per second was polls-per-second x value, so the camera swung 2.4x faster
+     * at 144 Hz than at 60 Hz and the documented "30" meant nothing on its own. An
+     * ini still carrying the old key just gets the default. */
+    g_lookSpeed = ClampInt((int)GetPrivateProfileIntW(L"Sticks", L"LookSpeed",
+                           1800, g_ini), 1, 20000);
+
+    g_log = GetPrivateProfileIntW(L"General", L"Log", 0, g_ini) != 0;
+
+    if (g_locksReady) LeaveCriticalSection(&g_padLock);
 }
 
 /* ------------------------------------------------------------------ chain */
@@ -208,9 +322,9 @@ static void LoadConfig(void)
 static HMODULE GetChain(void)
 {
     if (g_chain) return g_chain;
-    if (!g_lockReady) return NULL;
+    if (!g_locksReady) return NULL;
 
-    EnterCriticalSection(&g_lock);
+    EnterCriticalSection(&g_modLock);
     if (!g_chain) {
         wchar_t self[MAX_PATH], dir[MAX_PATH], cand[MAX_PATH], name[64];
         DWORD len = GetModuleFileNameW(g_self, self, MAX_PATH);
@@ -236,95 +350,210 @@ static HMODULE GetChain(void)
             }
         }
     }
-    LeaveCriticalSection(&g_lock);
+    LeaveCriticalSection(&g_modLock);
     return g_chain;
 }
 
+/* Module loading, so it belongs to g_modLock rather than g_padLock. Callers may already
+ * hold g_padLock; that ordering is fine and never reversed. */
 static void InitXInput(void)
 {
     if (g_XInputGetState) return;
-    const wchar_t* names[] = { L"xinput1_4.dll", L"xinput1_3.dll", L"xinput9_1_0.dll" };
-    for (int i = 0; i < 3; ++i) {
-        g_xinput = LoadLibraryW(names[i]);
-        if (g_xinput) {
-            g_XInputGetState = (PFN_XInputGetState)GetProcAddress(g_xinput, "XInputGetState");
-            if (g_XInputGetState) { Log("[xinput] using %S", names[i]); return; }
-            FreeLibrary(g_xinput); g_xinput = NULL;
+    if (!g_locksReady) return;
+
+    EnterCriticalSection(&g_modLock);
+    if (!g_XInputGetState) {
+        const wchar_t* names[] = { L"xinput1_4.dll", L"xinput1_3.dll", L"xinput9_1_0.dll" };
+        for (int i = 0; i < 3; ++i) {
+            g_xinput = LoadLibraryW(names[i]);
+            if (g_xinput) {
+                g_XInputGetState = (PFN_XInputGetState)GetProcAddress(g_xinput, "XInputGetState");
+                if (g_XInputGetState) { Log("[xinput] using %S", names[i]); break; }
+                FreeLibrary(g_xinput); g_xinput = NULL;
+            }
         }
+        if (!g_XInputGetState) Log("[xinput] no XInput runtime found");
     }
-    Log("[xinput] no XInput runtime found");
+    LeaveCriticalSection(&g_modLock);
 }
 
-/* ------------------------------------------------------------------ polling */
+/* ------------------------------------------------------------------ sampling */
 
-static void Press(int target)
+static void PressInto(PadSample* s, int target)
 {
     if (target <= 0) return;
     if (target >= MOUSE_BASE) {
         int b = target - MOUSE_BASE;
-        if (b >= 0 && b < 8) g_mouseBtn[b] = 0x80;
+        if (b >= 0 && b < 8) s->mouseBtn[b] = 0x80;
     }
     else if (target < 256) {
-        g_keys[target] = 0x80;
+        s->keys[target] = 0x80;
     }
 }
 
-/* Rebuilds the injected key/mouse state from the first connected pad. */
-static void PollPad(void)
+/* Is nobody touching this pad? Uses the configured deadzones, so a stick resting slightly
+ * off centre still counts as idle. */
+static BOOL PadIsIdle(const XINPUT_STATE* st)
 {
-    memset(g_keys, 0, sizeof(g_keys));
-    memset(g_mouseBtn, 0, sizeof(g_mouseBtn));
-    g_lookX = g_lookY = 0;
+    const XINPUT_GAMEPAD* g = &st->Gamepad;
+    double x, y;
+
+    if (g->wButtons) return FALSE;
+    if (g->bLeftTrigger  > g_triggerThreshold) return FALSE;
+    if (g->bRightTrigger > g_triggerThreshold) return FALSE;
+
+    PadApplyDeadzone(g->sThumbLX, g->sThumbLY, g_deadzone, &x, &y);
+    if (x != 0.0 || y != 0.0) return FALSE;
+    PadApplyDeadzone(g->sThumbRX, g->sThumbRY, g_lookDeadzone, &x, &y);
+    if (x != 0.0 || y != 0.0) return FALSE;
+
+    return TRUE;
+}
+
+/* Reads the pad we should be listening to. Returns FALSE if there is nothing to read.
+ * Caller must hold g_padLock.
+ *
+ * The cost model, which is the whole point of this function (see PadShouldScan):
+ *
+ *   playing on a pad      one XInputGetState, on the remembered index
+ *   nothing connected     one four-slot scan every kRescanSec, nothing in between
+ *   pad connected, idle   same, so swapping controllers mid-session still works
+ *
+ * Previously every poll walked slots 0..3 until one answered, from both wrapped devices,
+ * so an unplugged machine paid 8 slow calls a frame - about 1150 a second at 144 Hz. */
+static BOOL ReadPad(XINPUT_STATE* st, LONGLONG now)
+{
+    BOOL haveCurrent = FALSE;
+    memset(st, 0, sizeof(*st));
+
+    /* Fast path: a pad we already know about costs exactly one call. */
+    if (g_padIndex >= 0) {
+        if (g_XInputGetState((DWORD)g_padIndex, st) == ERROR_SUCCESS) {
+            haveCurrent = TRUE;
+        } else {
+            Log("[xinput] pad %d disconnected", g_padIndex);
+            g_padIndex = -1;
+            memset(st, 0, sizeof(*st));
+        }
+    }
+
+    double sinceScan = (g_lastScan == 0) ? 1e9 : SecondsSince(g_lastScan, now);
+    int    idle      = haveCurrent ? (PadIsIdle(st) ? 1 : 0) : 1;
+
+    if (!PadShouldScan(haveCurrent ? 1 : 0, idle, sinceScan, kRescanSec))
+        return haveCurrent;
+
+    g_lastScan = now;
+
+    for (DWORD i = 0; i < XUSER_MAX_COUNT; ++i) {
+        if (haveCurrent && (int)i == g_padIndex) continue;
+
+        XINPUT_STATE probe;
+        memset(&probe, 0, sizeof(probe));
+        if (g_XInputGetState(i, &probe) != ERROR_SUCCESS) continue;
+
+        /* Prefer a pad somebody is actually holding - that is how pad 1 gets picked up
+         * while pad 0 sits connected but untouched. With nothing current, take the
+         * first connected slot so a single idle pad still works. */
+        if (!haveCurrent || !PadIsIdle(&probe)) {
+            Log("[xinput] using pad %u", i);
+            g_padIndex = (int)i;
+            *st = probe;
+            return TRUE;
+        }
+    }
+
+    return haveCurrent;
+}
+
+/* ------------------------------------------------------------------ event sequencing */
+
+/* Learn DirectInput's current numbering from the events it just handed the caller.
+ * Caller must hold g_padLock. */
+static void SeqObserveLocked(const BYTE* base, DWORD count, DWORD cbObj)
+{
+    for (DWORD i = 0; i < count; ++i) {
+        const DIDEVICEOBJECTDATA_DX3* o =
+            (const DIDEVICEOBJECTDATA_DX3*)(base + (size_t)i * cbObj);
+        if (PadSeqAfter(o->dwSequence, g_seqAnchor)) g_seqAnchor = o->dwSequence;
+    }
+}
+
+/* Caller must hold g_padLock. */
+static DWORD SeqNextLocked(void)
+{
+    g_seqLast = (DWORD)PadSeqNext(g_seqAnchor, g_seqLast);
+    return g_seqLast;
+}
+
+/* Rebuilds g_pad from the active pad. Caller must hold g_padLock. */
+static void RebuildSample(LONGLONG now)
+{
+    memset(&g_pad, 0, sizeof(g_pad));
+    g_pad.taken = now;
 
     InitXInput();
     if (!g_XInputGetState) return;
 
     XINPUT_STATE st;
-    DWORD ok = ERROR_DEVICE_NOT_CONNECTED;
-    for (DWORD i = 0; i < XUSER_MAX_COUNT; ++i) {
-        memset(&st, 0, sizeof(st));
-        if (g_XInputGetState(i, &st) == ERROR_SUCCESS) { ok = ERROR_SUCCESS; break; }
-    }
-    if (ok != ERROR_SUCCESS) return;
+    if (!ReadPad(&st, now)) return;
 
     WORD b = st.Gamepad.wButtons;
-    if (b & XINPUT_GAMEPAD_A)              Press(g_mA);
-    if (b & XINPUT_GAMEPAD_B)              Press(g_mB);
-    if (b & XINPUT_GAMEPAD_X)              Press(g_mX);
-    if (b & XINPUT_GAMEPAD_Y)              Press(g_mY);
-    if (b & XINPUT_GAMEPAD_LEFT_SHOULDER)  Press(g_mLB);
-    if (b & XINPUT_GAMEPAD_RIGHT_SHOULDER) Press(g_mRB);
-    if (b & XINPUT_GAMEPAD_START)          Press(g_mStart);
-    if (b & XINPUT_GAMEPAD_BACK)           Press(g_mBack);
-    if (b & XINPUT_GAMEPAD_LEFT_THUMB)     Press(g_mLS);
-    if (b & XINPUT_GAMEPAD_RIGHT_THUMB)    Press(g_mRS);
-    if (b & XINPUT_GAMEPAD_DPAD_UP)        Press(g_mDU);
-    if (b & XINPUT_GAMEPAD_DPAD_DOWN)      Press(g_mDD);
-    if (b & XINPUT_GAMEPAD_DPAD_LEFT)      Press(g_mDL);
-    if (b & XINPUT_GAMEPAD_DPAD_RIGHT)     Press(g_mDR);
+    if (b & XINPUT_GAMEPAD_A)              PressInto(&g_pad, g_mA);
+    if (b & XINPUT_GAMEPAD_B)              PressInto(&g_pad, g_mB);
+    if (b & XINPUT_GAMEPAD_X)              PressInto(&g_pad, g_mX);
+    if (b & XINPUT_GAMEPAD_Y)              PressInto(&g_pad, g_mY);
+    if (b & XINPUT_GAMEPAD_LEFT_SHOULDER)  PressInto(&g_pad, g_mLB);
+    if (b & XINPUT_GAMEPAD_RIGHT_SHOULDER) PressInto(&g_pad, g_mRB);
+    if (b & XINPUT_GAMEPAD_START)          PressInto(&g_pad, g_mStart);
+    if (b & XINPUT_GAMEPAD_BACK)           PressInto(&g_pad, g_mBack);
+    if (b & XINPUT_GAMEPAD_LEFT_THUMB)     PressInto(&g_pad, g_mLS);
+    if (b & XINPUT_GAMEPAD_RIGHT_THUMB)    PressInto(&g_pad, g_mRS);
+    if (b & XINPUT_GAMEPAD_DPAD_UP)        PressInto(&g_pad, g_mDU);
+    if (b & XINPUT_GAMEPAD_DPAD_DOWN)      PressInto(&g_pad, g_mDD);
+    if (b & XINPUT_GAMEPAD_DPAD_LEFT)      PressInto(&g_pad, g_mDL);
+    if (b & XINPUT_GAMEPAD_DPAD_RIGHT)     PressInto(&g_pad, g_mDR);
 
-    if (st.Gamepad.bLeftTrigger  > g_triggerThreshold) Press(g_mLT);
-    if (st.Gamepad.bRightTrigger > g_triggerThreshold) Press(g_mRT);
+    if (st.Gamepad.bLeftTrigger  > g_triggerThreshold) PressInto(&g_pad, g_mLT);
+    if (st.Gamepad.bRightTrigger > g_triggerThreshold) PressInto(&g_pad, g_mRT);
 
-    /* Left stick -> digital movement keys. The game has no analog movement path. */
-    int lx = st.Gamepad.sThumbLX, ly = st.Gamepad.sThumbLY;
-    if (lx >  g_deadzone) Press(g_sRight);
-    if (lx < -g_deadzone) Press(g_sLeft);
-    if (ly >  g_deadzone) Press(g_sUp);
-    if (ly < -g_deadzone) Press(g_sDown);
+    /* Left stick -> digital movement keys. The game has no analog movement path, so
+     * the shaped vector is quantised into 8 directions: a key goes down once the stick
+     * is more than 22.5 degrees onto its axis, which is the standard 8-way split. */
+    double lx, ly;
+    PadApplyDeadzone(st.Gamepad.sThumbLX, st.Gamepad.sThumbLY, g_deadzone, &lx, &ly);
+        if (lx >  PAD_OCTANT) PressInto(&g_pad, g_sRight);
+    if (lx < -PAD_OCTANT) PressInto(&g_pad, g_sLeft);
+    if (ly >  PAD_OCTANT) PressInto(&g_pad, g_sUp);
+    if (ly < -PAD_OCTANT) PressInto(&g_pad, g_sDown);
 
     /* D-pad doubles as movement when not otherwise mapped. */
-    if ((b & XINPUT_GAMEPAD_DPAD_UP)   && g_mDU == 0) Press(g_sUp);
-    if ((b & XINPUT_GAMEPAD_DPAD_DOWN) && g_mDD == 0) Press(g_sDown);
+    if ((b & XINPUT_GAMEPAD_DPAD_UP)   && g_mDU == 0) PressInto(&g_pad, g_sUp);
+    if ((b & XINPUT_GAMEPAD_DPAD_DOWN) && g_mDD == 0) PressInto(&g_pad, g_sDown);
 
-    /* Right stick -> relative mouse motion, consumed by the mouse device wrapper. */
-    int rx = st.Gamepad.sThumbRX, ry = st.Gamepad.sThumbRY;
-    if (rx > g_lookDeadzone || rx < -g_lookDeadzone)
-        g_lookX = (LONG)((__int64)rx * g_lookSens / 32767);
-    if (ry > g_lookDeadzone || ry < -g_lookDeadzone) {
-        LONG dy = (LONG)((__int64)ry * g_lookSens / 32767);
-        g_lookY = g_invertLook ? dy : -dy;   /* stick up should look up */
-    }
+    /* Right stick -> look velocity in -1..1. The mouse wrapper multiplies by LookSpeed
+     * and by elapsed time; nothing here depends on how often we are polled. */
+    double rx, ry;
+    PadApplyDeadzone(st.Gamepad.sThumbRX, st.Gamepad.sThumbRY, g_lookDeadzone, &rx, &ry);
+    g_pad.lookX = rx;
+    g_pad.lookY = g_invertLook ? ry : -ry;   /* stick up should look up */
+}
+
+/* Copies out the current sample, refreshing it only if the last one has aged out. Two
+ * devices polled in the same frame therefore see one identical instant. */
+static void SamplePad(PadSample* out)
+{
+    memset(out, 0, sizeof(*out));
+    if (!g_locksReady) return;
+
+    EnterCriticalSection(&g_padLock);
+
+    LONGLONG now = Now();
+    if (g_pad.taken == 0 || SecondsSince(g_pad.taken, now) >= kSampleMaxAgeSec)
+        RebuildSample(now);
+
+    *out = g_pad;
+    LeaveCriticalSection(&g_padLock);
 }
 
 /* ------------------------------------------------------------------ device wrapper */
@@ -333,7 +562,10 @@ class DIDeviceProxy final : public IDirectInputDevice8A
 {
 public:
     DIDeviceProxy(IDirectInputDevice8A* real, bool isKeyboard)
-        : real_(real), isKeyboard_(isKeyboard) {}
+        : real_(real), isKeyboard_(isKeyboard), lastLook_(0), remX_(0.0), remY_(0.0)
+    {
+        memset(prev_, 0, sizeof(prev_));
+    }
 
     /* --- IUnknown --- */
 
@@ -364,12 +596,13 @@ public:
         HRESULT hr = real_->GetDeviceState(cb, data);
         if (FAILED(hr) || !data) return hr;
 
-        PollPad();
+        PadSample s;
+        SamplePad(&s);
 
         if (isKeyboard_) {
             if (cb >= 256) {
                 BYTE* k = (BYTE*)data;
-                for (int i = 0; i < 256; ++i) if (g_keys[i]) k[i] = 0x80;
+                for (int i = 0; i < 256; ++i) if (s.keys[i]) k[i] = 0x80;
             }
         }
         else {
@@ -377,13 +610,17 @@ public:
              * is identical with rgbButtons[8]. Accept either. */
             const DWORD btnOfs = (DWORD)FIELD_OFFSET(DIMOUSESTATE2, rgbButtons);
             if (cb >= btnOfs) {
+                LONG dx = 0, dy = 0;
+                ConsumeLook(s, &dx, &dy);
+
                 LONG* ax = (LONG*)data;
-                ax[0] += g_lookX;
-                ax[1] += g_lookY;
+                ax[0] += dx;
+                ax[1] += dy;
+
                 DWORD nb = cb - btnOfs;
-                if (nb > sizeof(g_mouseBtn)) nb = sizeof(g_mouseBtn);
+                if (nb > sizeof(s.mouseBtn)) nb = sizeof(s.mouseBtn);
                 BYTE* btn = (BYTE*)data + btnOfs;
-                for (DWORD i = 0; i < nb; ++i) if (g_mouseBtn[i]) btn[i] = 0x80;
+                for (DWORD i = 0; i < nb; ++i) if (s.mouseBtn[i]) btn[i] = 0x80;
             }
         }
         return hr;
@@ -404,7 +641,8 @@ public:
         /* A DX3-era caller passes the 16-byte struct; DX8 adds uAppData. */
         if (cbObj < sizeof(DIDEVICEOBJECTDATA_DX3)) return hr;
 
-        PollPad();
+        PadSample s;
+        SamplePad(&s);
 
         DWORD count = *pdwInOut;
         DWORD cap   = count;                        /* on entry: buffer capacity */
@@ -412,31 +650,36 @@ public:
         if (used > cap) return hr;
 
         BYTE* base = (BYTE*)rgdod;
-        BYTE  curB[8];
-        BYTE* cur;
-        BYTE* prev;
-        int   n;
 
-        if (isKeyboard_) { cur = g_keys; prev = g_prevKeys; n = 256; }
-        else {
-            memcpy(curB, g_mouseBtn, sizeof(curB));
-            cur = curB; prev = g_prevMouseBtn; n = (int)sizeof(curB);
-        }
+        /* prev_ is per-instance: the keyboard and mouse wrappers no longer share an
+         * edge-detection buffer, and s is already a private copy of the sample. */
+        const BYTE* cur = isKeyboard_ ? s.keys : s.mouseBtn;
+        const int   n   = isKeyboard_ ? 256 : (int)sizeof(s.mouseBtn);
+
+        /* One acquisition for the whole batch. The sequence anchor is shared with the
+         * other wrapped device because DirectInput's numbering is process-wide. */
+        if (g_locksReady) EnterCriticalSection(&g_padLock);
+
+        /* Read DirectInput's numbering off the events it just returned, then issue ours
+         * from just above it, so both sets compare correctly under DISEQUENCE_COMPARE. */
+        SeqObserveLocked(base, used, cbObj);
 
         for (int i = 0; i < n && used < cap; ++i) {
-            if (cur[i] == prev[i]) continue;
+            if (cur[i] == prev_[i]) continue;
             DIDEVICEOBJECTDATA_DX3* o =
                 (DIDEVICEOBJECTDATA_DX3*)(base + (size_t)used * cbObj);
             o->dwOfs       = isKeyboard_ ? (DWORD)i : (DWORD)MOUSE_BTN_OFS(i);
             o->dwData      = cur[i] ? 0x80 : 0x00;
             o->dwTimeStamp = GetTickCount();
-            o->dwSequence  = g_seq++;
+            o->dwSequence  = SeqNextLocked();
             if (cbObj >= sizeof(DIDEVICEOBJECTDATA))
                 ((DIDEVICEOBJECTDATA*)o)->uAppData = 0;
             used++;
         }
 
-        if (!peek) memcpy(prev, cur, (size_t)n);
+        if (g_locksReady) LeaveCriticalSection(&g_padLock);
+
+        if (!peek) memcpy(prev_, cur, (size_t)n);
         *pdwInOut = used;
         return hr;
     }
@@ -503,8 +746,40 @@ public:
     { return real_->GetImageInfo(a); }
 
 private:
+    /* Turns the right stick's velocity into a mouse delta for the time that has actually
+     * elapsed since this device last reported one.
+     *
+     * This is what makes look speed frame-rate independent. The old code added a fixed
+     * delta per poll, so motion per second was polls-per-second x delta and the camera
+     * ran 2.4x faster at 144 Hz than at 60 Hz. LookSpeed is now counts per second and
+     * means the same thing on every machine.
+     *
+     * The fractional part is carried over between calls, so a stick held just past the
+     * deadzone still moves the camera instead of truncating to zero every frame. */
+    void ConsumeLook(const PadSample& s, LONG* dx, LONG* dy)
+    {
+        *dx = 0;
+        *dy = 0;
+
+        LONGLONG now = Now();
+        double dt = SecondsSince(lastLook_, now);
+        lastLook_ = now;
+
+        /* First call, or a long gap - a menu, an alt-tab, a breakpoint. Start clean
+         * rather than applying the whole pause as one camera jump. */
+        if (dt <= 0.0 || dt > kMaxLookStepSec) { remX_ = remY_ = 0.0; return; }
+
+        *dx = (LONG)PadAccumulate(s.lookX, g_lookSpeed, dt, &remX_);
+        *dy = (LONG)PadAccumulate(s.lookY, g_lookSpeed, dt, &remY_);
+    }
+
     IDirectInputDevice8A* real_;
     bool                  isKeyboard_;
+
+    /* Per-instance, so the two device wrappers share nothing but the pad sample. */
+    BYTE                  prev_[256];   /* edge detection; mouse uses the first 8 */
+    LONGLONG              lastLook_;    /* QPC stamp of the last look delta reported */
+    double                remX_, remY_; /* sub-count carry */
 };
 
 /* ------------------------------------------------------------------ factory wrapper */
@@ -649,18 +924,25 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         if (kProxyMarker[0] == 0) return FALSE;   /* keeps the marker in the binary */
         g_self = (HMODULE)inst;
         DisableThreadLibraryCalls(inst);
-        InitializeCriticalSection(&g_lock);
-        g_lockReady = TRUE;
-        memset(g_keys, 0, sizeof(g_keys));
-        memset(g_prevKeys, 0, sizeof(g_prevKeys));
-        memset(g_mouseBtn, 0, sizeof(g_mouseBtn));
-        memset(g_prevMouseBtn, 0, sizeof(g_prevMouseBtn));
+
+        LARGE_INTEGER f;
+        g_qpcFreq = QueryPerformanceFrequency(&f) ? f.QuadPart : 0;
+
+        InitializeCriticalSection(&g_modLock);
+        InitializeCriticalSection(&g_padLock);
+        g_locksReady = TRUE;
+
+        memset(&g_pad, 0, sizeof(g_pad));
         BuildPaths();
         LoadConfig();
         /* No LoadLibrary here - the loader lock would deadlock. See GetChain(). */
     }
     else if (reason == DLL_PROCESS_DETACH && reserved == NULL) {
-        if (g_lockReady) { DeleteCriticalSection(&g_lock); g_lockReady = FALSE; }
+        if (g_locksReady) {
+            g_locksReady = FALSE;
+            DeleteCriticalSection(&g_padLock);
+            DeleteCriticalSection(&g_modLock);
+        }
     }
     return TRUE;
 }

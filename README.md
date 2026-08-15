@@ -112,8 +112,9 @@ powershell -ExecutionPolicy Bypass -File .\Fix-BGEAltTab.ps1 -Revert
 | `-WindowMode <0-2>` | `1` | 0 = windowed, 1 = borderless centred, 2 = borderless stretched. |
 | `-ProxyPath <path>` | `dist\d3d9.dll` | Prebuilt proxy to install. Verified 32-bit before use. |
 | `-InstallControllerSupport` | — | Add XInput (Xbox) controller support. |
-| `-PadLookSensitivity <1-200>` | `30` | Right-stick look speed. |
-| `-PadDeadzone <0-32000>` | `8000` | Stick deadzone in raw XInput units. |
+| `-PadLookSpeed <100-20000>` | `1800` | Right-stick look speed, in mouse counts per second at full deflection. Frame-rate independent. |
+| `-PadDeadzone <0-32000>` | `7849` | Left-stick deadzone, raw XInput units. Default is XInput's recommended value. |
+| `-PadLookDeadzone <0-32000>` | `8689` | Right-stick deadzone, raw XInput units. Default is XInput's recommended value. |
 | `-PadInvertLook` | — | Invert the right stick's vertical axis. |
 | `-PadPath <path>` | `dist\dinput8.dll` | Prebuilt controller proxy to install. |
 | `-ResetConfig` | — | Regenerate the `.ini` files. Without it, existing configs are preserved. |
@@ -290,6 +291,82 @@ DirectInput scan codes in hex, or `MOUSE1`..`MOUSE8`; `0` unmaps. `Log=1` writes
 Movement is digital because the game has no analog movement path — there is nothing to
 feed an analog value into. Look is genuinely analog, since it becomes relative mouse
 motion.
+
+### Input model
+
+The keyboard and mouse wrappers are two objects that have to agree about one controller,
+and look has to mean the same thing at any frame rate. Three rules do that:
+
+- **One sample, shared.** The pad is read into a single immutable snapshot under a lock
+  and copied out by value. A snapshot is reused for 2 ms, so both devices polled in the
+  same frame see the *same instant* rather than each re-reading XInput. Everything else —
+  edge-detection buffers, the look carry — is per device, so there is nothing left to
+  race on.
+- **Look is a velocity, not a per-poll delta.** The right stick is stored as −1..1, and
+  the mouse wrapper multiplies by `LookSpeed` and by the time actually elapsed since it
+  last reported motion (`QueryPerformanceCounter`). `LookSpeed` is therefore mouse counts
+  per second — a real unit. Adding a fixed delta per poll instead makes speed scale with
+  the poll rate: the same setting turned **2.4× faster at 144 Hz than at 60 Hz**. The
+  fractional remainder carries between calls, so a stick held just off centre moves the
+  camera slowly instead of truncating to zero.
+- **Finding the pad is throttled.** `XInputGetState` on an empty slot is a documented
+  slow path that Microsoft says not to call every frame. Walking indices 0–3 until one
+  answered did exactly that, from both wrapped devices — about **1150 slow calls a
+  second** at 144 Hz on a machine with no controller, which is most machines running an
+  Alt+Tab fix, in a game pinned to one core for timing stability. The connected index is
+  now remembered, so a poll costs one call; all four slots are only swept when nothing is
+  connected *or* the current pad is idle, and then at most every two seconds. Scanning
+  while idle is what lets you put down pad 0 and pick up pad 1 — previously the loop
+  stopped at the first slot that answered, so a connected-but-untouched pad 0 meant pad 1
+  was never read at all.
+- **The deadzone is radial and rescaled.** Thresholding each axis separately leaves a
+  cross-shaped dead region — at `Deadzone=8000` a diagonal push of `(8000, 8000)` failed
+  both axis tests despite being 11313 units out, so diagonals needed a harder push than
+  cardinals. It also stepped: output jumped from 0 straight to the raw axis value on
+  crossing. Now the test is on vector length and `[deadzone, full]` is remapped onto
+  `[0, 1]`, so the dead region is a disc and the response ramps from zero.
+- **Injected events are numbered in DirectInput's namespace.** In buffered mode the
+  synthetic events go into the same buffer as DirectInput's own, and applications compare
+  `dwSequence` with `DISEQUENCE_COMPARE` to order events across devices. A private counter
+  starting at 1 — the previous behaviour — is not in that namespace at all: every
+  injected event sorted before every real one, forever. There is no API to read
+  DirectInput's counter, so the proxy anchors instead, tracking the highest real sequence
+  number seen on either wrapped device and issuing synthetic events just above it.
+
+The maths lives in [`src/pad_support.h`](src/pad_support.h), which the proxy and the test
+suite both compile, so it is asserted on numerically with no controller attached:
+
+```
+PASS diagonal at the per-axis threshold is live -> len=130/1000 at raw(7849,7849)
+PASS dead region is circular, not cross-shaped  -> 0deg=487 45deg=487 90deg=487 (/1000)
+PASS response ramps from the deadzone edge      -> out=0/1000 just past edge
+PASS look speed is frame-rate independent       -> 30Hz=1800 60Hz=1800 144Hz=1800 counts/sec
+PASS sub-count motion is carried, not truncated -> 36 counts/sec at 2% deflection
+PASS unplugged cost is bounded                  -> 4 calls/sec unplugged at 144Hz, was 1152
+PASS no scans at all while playing              -> 0 scans in a second of play
+PASS synthetic event sorts after a delivered real event -> real=500000 synthetic=500001
+PASS re-anchors to a newer real sequence        -> last=500100 real=900000 -> 900001
+```
+
+### Scope
+
+The exported entry points are complete and every non-injected call forwards untouched, so
+another `dinput8` client that loads this DLL keeps working. The **injection**, though, is
+tuned for BGE, and one limit is worth stating rather than discovering:
+
+Sequence anchoring is correct against every event already delivered, but it cannot see
+into the future. A long burst of injected events with no real input in between runs our
+numbers ahead, so a real event arriving afterwards can land below one of ours. The window
+is bounded by the gap between real events — and inside that gap there is, by definition,
+no real event to be mis-ordered against. Still, an application that depends on exact
+cross-device ordering under `DISEQUENCE_COMPARE` should not assume this DLL is
+transparent. It is a BGE shim that behaves itself toward other clients, not a
+general-purpose `dinput8` replacement.
+
+**Upgrading:** `LookSensitivity` was counts per poll and has been replaced by `LookSpeed`
+in counts per second. An older `.ini` still carrying `LookSensitivity` is not converted —
+the key is ignored and `LookSpeed` falls back to its default. Run with `-ResetConfig` to
+regenerate the file, or add a `LookSpeed` line yourself.
 
 ---
 
