@@ -111,6 +111,11 @@ powershell -ExecutionPolicy Bypass -File .\Fix-BGEAltTab.ps1 -Revert
 | `-AffinityMask <int>` | `1` | CPU bitmask for the launcher. `1` = first core (matches the shim). `3` = first two cores. |
 | `-WindowMode <0-2>` | `1` | 0 = windowed, 1 = borderless centred, 2 = borderless stretched. |
 | `-ProxyPath <path>` | `dist\d3d9.dll` | Prebuilt proxy to install. Verified 32-bit before use. |
+| `-InstallControllerSupport` | — | Add XInput (Xbox) controller support. |
+| `-PadLookSensitivity <1-200>` | `30` | Right-stick look speed. |
+| `-PadDeadzone <0-32000>` | `8000` | Stick deadzone in raw XInput units. |
+| `-PadInvertLook` | — | Invert the right stick's vertical axis. |
+| `-PadPath <path>` | `dist\dinput8.dll` | Prebuilt controller proxy to install. |
 | `-NoShortcut` | — | Skip the launcher. **Leaves you with no affinity pinning at all.** |
 | `-NoWindowedProxy` | — | Skip the proxy. **Leaves the game in exclusive fullscreen.** |
 | `-NoElevate` | — | Error out instead of prompting for elevation. |
@@ -158,11 +163,12 @@ Needs Visual Studio Build Tools with the C++ workload. No DirectX SDK.
 src\build.cmd
 ```
 
-Output is `dist\d3d9.dll`. A prebuilt copy is committed, so this is only needed if you
-change the source.
+Output is `dist\d3d9.dll` and `dist\dinput8.dll`. Prebuilt copies are committed, so this is
+only needed if you change the source.
 
-To run the functional test — it loads the DLL, requests an exclusive-fullscreen device the
-way BGE does, and asserts the rewrite happened:
+The functional tests drive both proxies the way `BGE.exe` does — the d3d9 test requests an
+exclusive-fullscreen device and asserts the rewrite happened; the dinput8 test creates a
+real DirectInput keyboard, acquires it, and reads state through the proxy:
 
 ```bash
 src\build_test.cmd
@@ -171,8 +177,18 @@ src\build_test.cmd
 ```
 PASS proxy d3d9.dll loads          PASS proxy forced Windowed=TRUE
 PASS Direct3DCreate9 exported      PASS refresh rate zeroed for windowed
-PASS DebugSetMute exported         PASS window restyled to WS_POPUP
-PASS CreateDevice succeeded        PASS client area matches backbuffer
+PASS CreateDevice succeeded        PASS window restyled to WS_POPUP
+
+PASS proxy dinput8.dll loads       PASS SetDataFormat accepted
+PASS DirectInput8Create succeeded  PASS Acquire succeeded
+PASS keyboard device created       PASS GetDeviceState succeeded
+```
+
+Pass a number of seconds to watch live controller-to-key translation, which is the quickest
+way to check a mapping without launching the game:
+
+```bash
+src\build_test.cmd 15
 ```
 
 ### Configuration
@@ -192,6 +208,61 @@ on a 16:9 display, since D3D stretches the backbuffer to the client area.
 
 ---
 
+## Controller support (XInput)
+
+```bash
+powershell -ExecutionPolicy Bypass -File .\Fix-BGEAltTab.ps1 -InstallControllerSupport
+```
+
+The GOG release famously has no controller support, and that is not a setting anyone
+turned off. `BGE.exe` imports exactly one symbol from `dinput8.dll` —
+`DirectInput8Create` — and the binary contains no joystick, gamepad, axis or deadzone
+vocabulary at all. Gamepad handling only ever existed in the later Steam/Uplay builds.
+
+What the game *does* have is a DirectInput keyboard and mouse, and its bindings live in
+the registry as DirectInput scan codes:
+
+| Binding | Stored value | High word | Key |
+|---|---|---|---|
+| Up / Down / Left / Right | `0x00110008` … | `0x11 0x1F 0x1E 0x20` | `W S A D` |
+| Run / Accelerate | `0x0039001D` | `0x39` | Space |
+| Crouch | `0x001D001D` | `0x1D` | LCtrl |
+| Use object / Buddy | `0x00100013` / `0x0012000F` | `0x10` / `0x12` | Q / E |
+| Primary / Secondary action | `0x01020000` / `0x01030000` | mouse | LMB / RMB |
+
+So the game reads a 256-byte DirectInput keyboard state array indexed by scan code. That
+makes the reliable approach a `dinput8.dll` proxy that writes controller state directly
+into the buffer the game reads — rather than synthesising OS-level input with `SendInput`
+and hoping an exclusive-mode DirectInput device picks it up.
+
+[`src/dinput8_xinput.cpp`](src/dinput8_xinput.cpp) wraps `IDirectInput8::CreateDevice`.
+For the system keyboard and mouse it returns a device wrapper that merges XInput-derived
+state into both `GetDeviceState` (immediate mode) and `GetDeviceData` (buffered mode);
+every other device forwards untouched.
+
+### Default mapping
+
+| Control | Action | Sends |
+|---|---|---|
+| Left stick | Move | `W A S D` |
+| Right stick | Look | relative mouse |
+| A / B | Primary / secondary action | LMB / RMB |
+| X / Y | Use object / buddy | `Q` / `E` |
+| LB / RB | Look mode / center view | `LShift` / `C` |
+| LT / RT | Crouch / run · accelerate | `LCtrl` / `Space` |
+| Start / Back | Menu / map | `Esc` / `Tab` |
+| D-pad ←→ | Inventory prev / next | `2` / `3` |
+
+Everything is remappable in `dinput8_xinput.ini` next to the game executable. Values are
+DirectInput scan codes in hex, or `MOUSE1`..`MOUSE8`; `0` unmaps. `Log=1` writes
+`dinput8_xinput.log` for troubleshooting.
+
+Movement is digital because the game has no analog movement path — there is nothing to
+feed an analog value into. Look is genuinely analog, since it becomes relative mouse
+motion.
+
+---
+
 ## What it changes
 
 | Change | Location |
@@ -199,7 +270,8 @@ on a 16:9 display, since D3D stretches the backbuffer to the client area.
 | Shim database uninstalled | `HKLM\...\AppCompatFlags\Custom\BGE.exe` + `%WINDIR%\AppPatch\CustomSDB\` |
 | Launcher shortcut created | `%USERPROFILE%\Desktop\Beyond Good & Evil (Alt+Tab Fix).lnk` |
 | Proxy + config installed | `<game>\d3d9.dll`, `<game>\d3d9_windowed.ini` |
-| Pre-existing `d3d9.dll` renamed | `<game>\d3d9_chain.dll` (restored on `-Revert`) |
+| Controller proxy + config | `<game>\dinput8.dll`, `<game>\dinput8_xinput.ini` — only with `-InstallControllerSupport` |
+| Pre-existing DLLs renamed | `<game>\d3d9_chain.dll`, `<game>\dinput8_chain.dll` (restored on `-Revert`) |
 | Backups + revert data | `%ProgramData%\BGEAltTabFix\` |
 
 The original `goggame.sdb` also remains untouched in the game folder, so the change is

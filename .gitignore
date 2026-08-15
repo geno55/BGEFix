@@ -5,10 +5,13 @@
 *.pdb
 *.ilk
 
-# test binary and proxy runtime output
+# test binaries and proxy runtime output
 dist/test_proxy.exe
+dist/test_dinput.exe
 dist/d3d9_windowed.log
 dist/d3d9_windowed.ini
+dist/dinput8_xinput.log
+dist/dinput8_xinput.ini
 
 *.bak
 

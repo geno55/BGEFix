@@ -55,6 +55,24 @@
     0 = windowed with a title bar, 1 = borderless centred at the game's resolution
     (default), 2 = borderless stretched to fill the monitor.
 
+.PARAMETER InstallControllerSupport
+    Install the dinput8 proxy that adds XInput (Xbox) controller support. The GOG
+    build has no gamepad code at all, so the proxy maps the pad onto the DirectInput
+    keyboard and mouse state the game already reads. Remappable afterwards in
+    dinput8_xinput.ini.
+
+.PARAMETER PadPath
+    Path to a prebuilt dinput8 proxy. Defaults to dist\dinput8.dll beside this script.
+
+.PARAMETER PadLookSensitivity
+    Right-stick look speed, 1-200. Default 30.
+
+.PARAMETER PadDeadzone
+    Stick deadzone in raw XInput units, 0-32000. Default 8000.
+
+.PARAMETER PadInvertLook
+    Invert the right stick's vertical look axis.
+
 .PARAMETER NoElevate
     Fail with an error instead of relaunching elevated when not running as admin.
 
@@ -96,6 +114,13 @@ param(
     [string]   $ProxyPath,
     [ValidateRange(0, 2)]
     [int]      $WindowMode = 1,
+    [switch]   $InstallControllerSupport,
+    [string]   $PadPath,
+    [ValidateRange(1, 200)]
+    [int]      $PadLookSensitivity = 30,
+    [ValidateRange(0, 32000)]
+    [int]      $PadDeadzone = 8000,
+    [switch]   $PadInvertLook,
     [switch]   $NoElevate,
     [switch]   $Force
 )
@@ -420,73 +445,146 @@ function Test-Pe32 {
     catch { return $false }
 }
 
-function Install-WindowedProxy {
+function Install-ProxyDll {
     <#
-        Installs the in-repo d3d9 proxy, which forces the game out of exclusive
-        fullscreen so Alt+Tab is safe. Self-contained: no third-party download.
+        Shared installer for the in-repo proxy DLLs (d3d9.dll and dinput8.dll).
 
-        Only one file can be named d3d9.dll. If the game folder already has one from
-        another project (dgVoodoo, DXVK, ReShade), it is renamed to
-        d3d9_chain.dll and our proxy forwards to it rather than replacing it.
+        Only one file can carry each of those names. If the game folder already has one
+        from another project (dgVoodoo, DXVK, ReShade), it is renamed to <name>_chain.dll
+        and our proxy forwards to it rather than replacing it.
     #>
-    param([string]$Folder)
+    param(
+        [string]   $Folder,
+        [string]   $Source,
+        [string]   $TargetName,
+        [string]   $ChainName,
+        [string]   $IniName,
+        [string[]] $IniLines,
+        [string]   $Label
+    )
 
-    $proxy = $ProxyPath
-    if (-not $proxy) { $proxy = Join-Path $PSScriptRoot 'dist\d3d9.dll' }
-
-    if (-not (Test-Path -LiteralPath $proxy)) {
-        Write-Warn2 "Proxy DLL not found: $proxy"
+    if (-not (Test-Path -LiteralPath $Source)) {
+        Write-Warn2 "$Label DLL not found: $Source"
         Write-Info  'Build it first:   src\build.cmd'
-        Write-Info  'Or pass an existing build with -ProxyPath.'
         return $null
     }
-    if (-not (Test-Pe32 -Path $proxy)) {
-        throw "$proxy is not a 32-bit DLL. BGE.exe is a 32-bit process and cannot load it. Rebuild with src\build.cmd."
+    if (-not (Test-Pe32 -Path $Source)) {
+        throw "$Source is not a 32-bit DLL. BGE.exe is a 32-bit process and cannot load it. Rebuild with src\build.cmd."
     }
 
-    $target  = Join-Path $Folder 'd3d9.dll'
+    $target  = Join-Path $Folder $TargetName
     $chained = ''
 
     if (Test-Path -LiteralPath $target) {
         $have = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
-        $ours = (Get-FileHash -LiteralPath $proxy  -Algorithm SHA256).Hash
+        $ours = (Get-FileHash -LiteralPath $Source -Algorithm SHA256).Hash
 
-        if ($have -eq $ours) {
-            Write-Ok 'Proxy already installed and current'
-        }
-        else {
-            $chainTarget = Join-Path $Folder 'd3d9_chain.dll'
+        if ($have -ne $ours) {
+            $chainTarget = Join-Path $Folder $ChainName
             if (Test-Path -LiteralPath $chainTarget) {
-                throw ("Both d3d9.dll and d3d9_chain.dll already exist in the game folder. " +
+                throw ("Both $TargetName and $ChainName already exist in the game folder. " +
                        "Resolve that by hand so nothing is lost, then re-run.")
             }
-            Backup-File -Path $target -Label 'd3d9-preexisting.dll' | Out-Null
+            Backup-File -Path $target -Label "$TargetName-preexisting" | Out-Null
             Move-Item -LiteralPath $target -Destination $chainTarget -Force
             $chained = $chainTarget
-            Write-Ok 'Existing d3d9.dll renamed to d3d9_chain.dll; the proxy will forward to it'
+            Write-Ok "Existing $TargetName renamed to $ChainName; the proxy will forward to it"
         }
     }
 
-    Copy-Item -LiteralPath $proxy -Destination $target -Force
+    Copy-Item -LiteralPath $Source -Destination $target -Force
 
-    $ini = Join-Path $Folder 'd3d9_windowed.ini'
-    $desc = @('windowed with a title bar', 'borderless, centred at game resolution',
-              'borderless, stretched to fill the monitor')[$WindowMode]
-    $lines = @(
-        '; d3d9_windowed - forces the game out of exclusive fullscreen so Alt+Tab is safe.',
-        '; Mode 0 = windowed   1 = borderless centred (default)   2 = borderless stretched',
-        '[Display]',
-        "Mode=$WindowMode",
-        'Log=0',
-        'Chain=d3d9_chain.dll'
-    )
-    [System.IO.File]::WriteAllLines($ini, $lines, (New-Object System.Text.UTF8Encoding($false)))
+    $ini = Join-Path $Folder $IniName
+    [System.IO.File]::WriteAllLines($ini, $IniLines, (New-Object System.Text.UTF8Encoding($false)))
 
-    Write-Ok "Windowed proxy installed (mode $WindowMode - $desc)"
-    Write-Info "d3d9.dll  -> $target"
-    Write-Info "config    -> $ini"
+    Write-Info "$TargetName -> $target"
+    Write-Info "config      -> $ini"
 
     return [pscustomobject]@{ Target = $target; Ini = $ini; Chained = $chained }
+}
+
+function Install-WindowedProxy {
+    # Forces the game out of exclusive fullscreen so Alt+Tab is safe.
+    param([string]$Folder)
+
+    $src = $ProxyPath
+    if (-not $src) { $src = Join-Path $PSScriptRoot 'dist\d3d9.dll' }
+
+    $desc = @('windowed with a title bar', 'borderless, centred at game resolution',
+              'borderless, stretched to fill the monitor')[$WindowMode]
+
+    $r = Install-ProxyDll -Folder $Folder -Source $src -TargetName 'd3d9.dll' `
+            -ChainName 'd3d9_chain.dll' -IniName 'd3d9_windowed.ini' -Label 'Windowed proxy' `
+            -IniLines @(
+                '; d3d9_windowed - forces the game out of exclusive fullscreen so Alt+Tab is safe.',
+                '; Mode 0 = windowed   1 = borderless centred (default)   2 = borderless stretched',
+                '[Display]',
+                "Mode=$WindowMode",
+                'Log=0',
+                'Chain=d3d9_chain.dll'
+            )
+    if ($r) { Write-Ok "Windowed proxy installed (mode $WindowMode - $desc)" }
+    return $r
+}
+
+function Install-ControllerSupport {
+    <#
+        Installs the dinput8 proxy that maps an XInput pad onto the keyboard and mouse
+        state the game already reads.
+
+        BGE.exe has no gamepad code: it imports only DirectInput8Create and contains no
+        joystick vocabulary. Its bindings are stored as DirectInput scan codes, so the
+        proxy writes controller state straight into the 256-byte keyboard array and the
+        mouse state the game polls. Defaults below mirror the game's own bindings.
+    #>
+    param([string]$Folder)
+
+    $src = $PadPath
+    if (-not $src) { $src = Join-Path $PSScriptRoot 'dist\dinput8.dll' }
+
+    $r = Install-ProxyDll -Folder $Folder -Source $src -TargetName 'dinput8.dll' `
+            -ChainName 'dinput8_chain.dll' -IniName 'dinput8_xinput.ini' -Label 'Controller' `
+            -IniLines @(
+                '; dinput8_xinput - XInput (Xbox) controller support for Beyond Good & Evil.',
+                '; Values are DirectInput scan codes (hex) or MOUSE1..MOUSE8. 0 = unmapped.',
+                '[Buttons]',
+                'A=MOUSE1                ; primary action',
+                'B=MOUSE2                ; secondary action',
+                'X=0x10                  ; Q - use object',
+                'Y=0x12                  ; E - buddy / compass',
+                'LB=0x2A                 ; LShift - look mode',
+                'RB=0x2E                 ; C - center view',
+                'LT=0x1D                 ; LCtrl - crouch',
+                'RT=0x39                 ; Space - run / accelerate',
+                'Start=0x01              ; Esc - menu',
+                'Back=0x0F               ; Tab - map',
+                'LS=0',
+                'RS=0x2E                 ; C - center view',
+                'DPadUp=0',
+                'DPadDown=0',
+                'DPadLeft=0x03           ; 2 - inventory prev',
+                'DPadRight=0x04          ; 3 - inventory next',
+                'TriggerThreshold=60',
+                '',
+                '[Sticks]',
+                'LeftUp=0x11             ; W',
+                'LeftDown=0x1F           ; S',
+                'LeftLeft=0x1E           ; A',
+                'LeftRight=0x20          ; D',
+                "Deadzone=$PadDeadzone",
+                "LookDeadzone=$PadDeadzone",
+                "LookSensitivity=$PadLookSensitivity",
+                "InvertLook=$([int]$PadInvertLook.IsPresent)",
+                '',
+                '[General]',
+                'Log=0',
+                'Chain=dinput8_chain.dll'
+            )
+    if ($r) {
+        Write-Ok "Controller support installed (look sensitivity $PadLookSensitivity, deadzone $PadDeadzone)"
+        Write-Info 'Left stick moves, right stick looks, A = primary action. Remap in dinput8_xinput.ini.'
+    }
+    return $r
 }
 
 #endregion
@@ -538,6 +636,16 @@ function Show-Status {
         Write-Warn2 'Windowed proxy not installed'
     }
 
+    if (Test-Path -LiteralPath (Join-Path $Folder 'dinput8_xinput.ini')) {
+        Write-Ok 'Controller support installed (XInput -> DirectInput keyboard/mouse)'
+        if (Test-Path -LiteralPath (Join-Path $Folder 'dinput8_chain.dll')) {
+            Write-Info 'Chaining to dinput8_chain.dll'
+        }
+    }
+    else {
+        Write-Warn2 'Controller support not installed'
+    }
+
     $state = Get-State
     if ($state) { Write-Info "Fix applied on: $($state.AppliedUtc) UTC" }
     Write-Host ''
@@ -558,7 +666,8 @@ function Invoke-Apply {
     if ($db)            { $steps.Add("Remove shim database $($db.Guid) ('$($db.Description)')") }
     else                { $steps.Add('Shim database already absent - nothing to remove') }
     if (-not $NoShortcut) { $steps.Add("Create affinity launcher shortcut (mask $AffinityMask)") }
-    if (-not $NoWindowedProxy) { $steps.Add("Install d3d9 windowed proxy (window mode $WindowMode)") }
+    if (-not $NoWindowedProxy)     { $steps.Add("Install d3d9 windowed proxy (window mode $WindowMode)") }
+    if ($InstallControllerSupport) { $steps.Add('Install dinput8 XInput controller support') }
 
     $i = 1
     foreach ($s in $steps) { Write-Host "  $i. $s"; $i++ }
@@ -587,6 +696,9 @@ function Invoke-Apply {
         ProxyTarget    = ''
         ProxyIni       = ''
         ProxyChained   = ''
+        PadTarget      = ''
+        PadIni         = ''
+        PadChained     = ''
     }
 
     # ---- 1. shim database ------------------------------------------------
@@ -652,6 +764,18 @@ function Invoke-Apply {
         Write-Info  'Alt+Tab will work, but the HUD can corrupt when you return.'
     }
 
+    # ---- 4. controller support -------------------------------------------
+    if ($InstallControllerSupport) {
+        if ($PSCmdlet.ShouldProcess($Folder, 'Install XInput controller support')) {
+            $pad = Install-ControllerSupport -Folder $Folder
+            if ($pad) {
+                $state.PadTarget  = $pad.Target
+                $state.PadIni     = $pad.Ini
+                $state.PadChained = $pad.Chained
+            }
+        }
+    }
+
     if (-not $WhatIfPreference) {
         Save-State -State $state
         Write-Host ''
@@ -711,26 +835,32 @@ function Invoke-Revert {
         }
     }
 
-    # ---- windowed proxy --------------------------------------------------
-    # If the proxy displaced an existing d3d9.dll it was renamed to d3d9_chain.dll;
+    # ---- proxy DLLs ------------------------------------------------------
+    # If a proxy displaced an existing DLL it was renamed to <name>_chain.dll;
     # putting it back is part of leaving the folder as we found it.
     if ($state) {
-        $pTarget  = ''
-        $pIni     = ''
-        $pChained = ''
-        if ($state.PSObject.Properties.Name -contains 'ProxyTarget')  { $pTarget  = [string]$state.ProxyTarget }
-        if ($state.PSObject.Properties.Name -contains 'ProxyIni')     { $pIni     = [string]$state.ProxyIni }
-        if ($state.PSObject.Properties.Name -contains 'ProxyChained') { $pChained = [string]$state.ProxyChained }
+        $sets = @(
+            @{ T = 'ProxyTarget'; I = 'ProxyIni'; C = 'ProxyChained'; Label = 'Windowed proxy' },
+            @{ T = 'PadTarget';   I = 'PadIni';   C = 'PadChained';   Label = 'Controller support' }
+        )
+        $names = $state.PSObject.Properties.Name
 
-        if ($pTarget -and (Test-Path -LiteralPath $pTarget)) {
-            if ($PSCmdlet.ShouldProcess($pTarget, 'Remove windowed proxy')) {
-                Remove-Item -LiteralPath $pTarget -Force
-                if ($pIni -and (Test-Path -LiteralPath $pIni)) { Remove-Item -LiteralPath $pIni -Force }
-                Write-Ok 'Windowed proxy removed'
+        foreach ($set in $sets) {
+            $t = ''; $i = ''; $c = ''
+            if ($names -contains $set.T) { $t = [string]$state.($set.T) }
+            if ($names -contains $set.I) { $i = [string]$state.($set.I) }
+            if ($names -contains $set.C) { $c = [string]$state.($set.C) }
 
-                if ($pChained -and (Test-Path -LiteralPath $pChained)) {
-                    Move-Item -LiteralPath $pChained -Destination $pTarget -Force
-                    Write-Ok 'Restored the previous d3d9.dll from d3d9_chain.dll'
+            if ($t -and (Test-Path -LiteralPath $t)) {
+                if ($PSCmdlet.ShouldProcess($t, "Remove $($set.Label)")) {
+                    Remove-Item -LiteralPath $t -Force
+                    if ($i -and (Test-Path -LiteralPath $i)) { Remove-Item -LiteralPath $i -Force }
+                    Write-Ok "$($set.Label) removed"
+
+                    if ($c -and (Test-Path -LiteralPath $c)) {
+                        Move-Item -LiteralPath $c -Destination $t -Force
+                        Write-Ok "Restored the previous $(Split-Path $t -Leaf) from $(Split-Path $c -Leaf)"
+                    }
                 }
             }
         }

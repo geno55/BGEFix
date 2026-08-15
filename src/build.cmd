@@ -54,17 +54,27 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo Building d3d9.dll ...
 pushd "%OUTDIR%"
-rem /MT links the CRT statically so the DLL has no redistributable dependency.
+
+rem /MT links the CRT statically so the DLLs have no redistributable dependency.
+echo Building d3d9.dll ...
 cl /nologo /LD /MT /O1 /W4 /WX /DNDEBUG ^
    /Fe:d3d9.dll "%SRC%" ^
    /link /DEF:"%DEF%" /MACHINE:X86 kernel32.lib user32.lib
 set RC=%ERRORLEVEL%
+if not "%RC%"=="0" goto :done
+
+echo Building dinput8.dll ...
+cl /nologo /LD /MT /O1 /W4 /WX /DNDEBUG ^
+   /Fe:dinput8.dll "%~dp0dinput8_xinput.cpp" ^
+   /link /DEF:"%~dp0dinput8_xinput.def" /MACHINE:X86 kernel32.lib user32.lib
+set RC=%ERRORLEVEL%
+
+:done
 popd
 
 del /q "%OUTDIR%\*.obj" 2>nul
-del /q "%OUTDIR%\d3d9.exp" "%OUTDIR%\d3d9.lib" 2>nul
+del /q "%OUTDIR%\*.exp" "%OUTDIR%\*.lib" 2>nul
 
 if not "%RC%"=="0" (
     echo BUILD FAILED ^(exit %RC%^)
@@ -73,4 +83,5 @@ if not "%RC%"=="0" (
 
 echo.
 echo Built: %OUTDIR%\d3d9.dll
+echo Built: %OUTDIR%\dinput8.dll
 exit /b 0

@@ -1,0 +1,13 @@
+; Undecorated exports a dinput8 client expects. BGE.exe imports only
+; DirectInput8Create, but the COM entry points are forwarded too so the DLL is a
+; drop-in replacement for anything else that loads it.
+LIBRARY dinput8
+EXPORTS
+    DirectInput8Create
+    GetdfDIJoystick
+    ; PRIVATE keeps the COM entry points out of the generated import library,
+    ; which is what LNK4104 asks for. They are still exported from the DLL.
+    DllCanUnloadNow      PRIVATE
+    DllGetClassObject    PRIVATE
+    DllRegisterServer    PRIVATE
+    DllUnregisterServer  PRIVATE

@@ -18,15 +18,28 @@ pushd "%OUTDIR%"
 cl /nologo /MT /O1 /W4 /DNDEBUG /Fe:test_proxy.exe "%~dp0test_proxy.cpp" ^
    /link /MACHINE:X86 kernel32.lib user32.lib
 set RC=%ERRORLEVEL%
+if not "%RC%"=="0" ( echo BUILD FAILED & popd & exit /b %RC% )
+
+cl /nologo /MT /O1 /W4 /DNDEBUG /Fe:test_dinput.exe "%~dp0test_dinput.cpp" ^
+   /link /MACHINE:X86 kernel32.lib user32.lib
+set RC=%ERRORLEVEL%
 del /q *.obj 2>nul
 if not "%RC%"=="0" ( echo BUILD FAILED & popd & exit /b %RC% )
 
 echo.
-echo Running functional test...
+echo === d3d9 windowed proxy ===
 echo.
 rem Absolute path: cmd will not resolve an exe from the working directory when
 rem NoDefaultCurrentDirectoryInExePath is set.
 "%OUTDIR%\test_proxy.exe"
 set RC=%ERRORLEVEL%
+
+echo.
+echo === dinput8 xinput proxy ===
+echo.
+rem Pass a number of seconds to watch live controller input, e.g. build_test.cmd 15
+"%OUTDIR%\test_dinput.exe" %1
+if not "%ERRORLEVEL%"=="0" set RC=%ERRORLEVEL%
+
 popd
 exit /b %RC%
