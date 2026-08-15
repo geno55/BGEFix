@@ -4,7 +4,11 @@ rem ---------------------------------------------------------------------------
 rem Builds d3d9.dll (32-bit) from d3d9_windowed.cpp.
 rem
 rem The output MUST be 32-bit: BGE.exe is a 32-bit process and will not load a
-rem 64-bit DLL. No DirectX headers are needed - only windows.h and kernel32/user32.
+rem 64-bit DLL.
+rem
+rem Headers come from the Windows SDK: d3d9.h lives under Include\<ver>\shared, and
+rem dinput.h / xinput.h under Include\<ver>\um. The legacy DirectX SDK is NOT needed.
+rem dxguid.lib (also in the Windows SDK) supplies GUID_SysKeyboard / GUID_SysMouse.
 rem ---------------------------------------------------------------------------
 
 set OUTDIR=%~dp0..\dist
@@ -58,16 +62,16 @@ pushd "%OUTDIR%"
 
 rem /MT links the CRT statically so the DLLs have no redistributable dependency.
 echo Building d3d9.dll ...
-cl /nologo /LD /MT /O1 /W4 /WX /DNDEBUG ^
+cl /nologo /LD /MT /O1 /W4 /WX /EHsc /DNDEBUG ^
    /Fe:d3d9.dll "%SRC%" ^
    /link /DEF:"%DEF%" /MACHINE:X86 kernel32.lib user32.lib
 set RC=%ERRORLEVEL%
 if not "%RC%"=="0" goto :done
 
 echo Building dinput8.dll ...
-cl /nologo /LD /MT /O1 /W4 /WX /DNDEBUG ^
+cl /nologo /LD /MT /O1 /W4 /WX /EHsc /DNDEBUG ^
    /Fe:dinput8.dll "%~dp0dinput8_xinput.cpp" ^
-   /link /DEF:"%~dp0dinput8_xinput.def" /MACHINE:X86 kernel32.lib user32.lib
+   /link /DEF:"%~dp0dinput8_xinput.def" /MACHINE:X86 kernel32.lib user32.lib dxguid.lib
 set RC=%ERRORLEVEL%
 
 :done

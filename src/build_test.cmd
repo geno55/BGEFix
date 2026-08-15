@@ -15,13 +15,14 @@ if errorlevel 1 exit /b 1
 
 :have_cl
 pushd "%OUTDIR%"
-cl /nologo /MT /O1 /W4 /DNDEBUG /Fe:test_proxy.exe "%~dp0test_proxy.cpp" ^
+rem dxguid.lib (Windows SDK) supplies GUID_SysKeyboard / GUID_Key / IID_IDirectInput8A.
+cl /nologo /MT /O1 /W4 /EHsc /DNDEBUG /Fe:test_proxy.exe "%~dp0test_proxy.cpp" ^
    /link /MACHINE:X86 kernel32.lib user32.lib
 set RC=%ERRORLEVEL%
 if not "%RC%"=="0" ( echo BUILD FAILED & popd & exit /b %RC% )
 
-cl /nologo /MT /O1 /W4 /DNDEBUG /Fe:test_dinput.exe "%~dp0test_dinput.cpp" ^
-   /link /MACHINE:X86 kernel32.lib user32.lib
+cl /nologo /MT /O1 /W4 /EHsc /DNDEBUG /Fe:test_dinput.exe "%~dp0test_dinput.cpp" ^
+   /link /MACHINE:X86 kernel32.lib user32.lib dxguid.lib
 set RC=%ERRORLEVEL%
 del /q *.obj 2>nul
 if not "%RC%"=="0" ( echo BUILD FAILED & popd & exit /b %RC% )

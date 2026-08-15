@@ -129,9 +129,24 @@ powershell -ExecutionPolicy Bypass -File .\Fix-BGEAltTab.ps1 -Revert
 ## The windowed proxy
 
 [`src/d3d9_windowed.cpp`](src/d3d9_windowed.cpp) is a small Direct3D 9 proxy that does
-exactly one thing: rewrite `D3DPRESENT_PARAMETERS::Windowed` to `TRUE` in
-`IDirect3D9::CreateDevice`, zero the fullscreen refresh rate (illegal once windowed), and
-restyle the game window. It does not touch aspect ratio, resolution, FOV, or shaders.
+exactly one thing: rewrite `D3DPRESENT_PARAMETERS::Windowed` to `TRUE`, zero the
+fullscreen refresh rate (illegal once windowed), and restyle the game window. It does not
+touch aspect ratio, resolution, FOV, or shaders.
+
+It applies that edit at **both** places a D3D9 application sets the field:
+
+| Call site | When the game reaches it |
+| --- | --- |
+| `IDirect3D9::CreateDevice` | once, at startup |
+| `IDirect3DDevice9::Reset` | device-lost recovery, and any resolution or display change |
+
+Intercepting only `CreateDevice` produces a fix that looks correct at launch and quietly
+expires the first time the game resets — change the resolution in `SettingsApplication.exe`
+or lose the device for any reason, and the game resets with `Windowed = FALSE`, drops back
+into exclusive fullscreen, and the HUD corruption returns mid-session. So the device
+returned by `CreateDevice` is wrapped too, and both paths run the same edit.
+`CreateAdditionalSwapChain` is a third present-parameters entry point and is covered for
+completeness, though D3D9 already requires windowed there.
 
 It exists so this tool has no external dependency. The alternative was pulling a 1.29 MB
 unverifiable binary from an anonymous uploader — behind a Cloudflare check, with no stable
@@ -139,10 +154,14 @@ download URL — in order to set one boolean.
 
 ### Design notes
 
-- **No DirectX headers.** `d3d9.h` is not in a default Windows SDK install. Since the
-  proxy only ever forwards vtable slots and never calls a D3D method by name, it declares
-  the `IDirect3D9` vtable layout and `D3DPRESENT_PARAMETERS` directly. Only `windows.h`,
-  `kernel32` and `user32` are needed.
+- **Interfaces come from the Windows SDK.** `d3d9.h` ships under
+  `Include\<ver>\shared` (not `um\`, which is where people tend to look and conclude it
+  is missing); `dinput.h` and `xinput.h` are under `um\`. The proxies derive from
+  `IDirect3D9`, `IDirectInput8A` and `IDirectInputDevice8A`, so the compiler emits the
+  vtables and every slot and signature is checked at build time. Hand-declaring these
+  layouts to skip an `#include` trades a compile error for silent stack corruption —
+  it already cost this project one bug, in `IDirect3D9::GetAdapterMonitor`. The legacy
+  DirectX SDK is still not required.
 - **32-bit, always.** `BGE.exe` is a 32-bit process and silently fails to load a 64-bit
   DLL. The build forces `/MACHINE:X86` and the installer re-verifies the PE machine type
   before copying anything.
@@ -158,7 +177,9 @@ download URL — in order to set one boolean.
 
 ### Building
 
-Needs Visual Studio Build Tools with the C++ workload. No DirectX SDK.
+Needs Visual Studio Build Tools with the C++ workload, which brings the Windows SDK that
+supplies `d3d9.h`, `dinput.h`, `xinput.h` and `dxguid.lib`. The legacy DirectX SDK is not
+needed.
 
 ```bash
 src\build.cmd
@@ -169,7 +190,9 @@ only needed if you change the source.
 
 The functional tests drive both proxies the way `BGE.exe` does — the d3d9 test requests an
 exclusive-fullscreen device and asserts the rewrite happened; the dinput8 test creates a
-real DirectInput keyboard, acquires it, and reads state through the proxy:
+real DirectInput keyboard, acquires it, and reads state through the proxy. Both also call
+methods far down the vtable (`GetAdapterMonitor`, `Poll`) so that layout drift between a
+wrapper and the real interface shows up as a failing test rather than a crash in-game:
 
 ```bash
 src\build_test.cmd
@@ -179,11 +202,17 @@ src\build_test.cmd
 PASS proxy d3d9.dll loads          PASS proxy forced Windowed=TRUE
 PASS Direct3DCreate9 exported      PASS refresh rate zeroed for windowed
 PASS CreateDevice succeeded        PASS window restyled to WS_POPUP
+PASS device is wrapped             PASS proxy forced Windowed=TRUE on Reset
+PASS Reset succeeded               PASS window still borderless after Reset
 
 PASS proxy dinput8.dll loads       PASS SetDataFormat accepted
 PASS DirectInput8Create succeeded  PASS Acquire succeeded
 PASS keyboard device created       PASS GetDeviceState succeeded
+SKIP XInput pad connected on port 0 -> none detected, injection not exercised
 ```
+
+A controller is not required to run the suite. When none is attached that last line reads
+`SKIP` and the run still passes — everything above it exercises the proxy itself.
 
 Pass a number of seconds to watch live controller-to-key translation, which is the quickest
 way to check a mapping without launching the game:

@@ -24,6 +24,20 @@
  * device wrapper whose GetDeviceState (immediate mode) and GetDeviceData (buffered mode)
  * merge in state derived from XInput. Everything else forwards untouched.
  *
+ * How the interfaces are modelled
+ * -------------------------------
+ * dinput.h and xinput.h both ship with the Windows SDK, so the interfaces, the device
+ * GUIDs, the DIMOUSESTATE offsets and the XInput button bits all come from the headers.
+ * The wrappers derive from IDirectInput8A / IDirectInputDevice8A, which means the
+ * compiler emits the vtables: a wrong slot order or a mistyped parameter is a build
+ * failure, not a call through the wrong function pointer. See the note in
+ * d3d9_windowed.cpp about the bug hand-written vtables actually caused here.
+ *
+ * ANSI vs Unicode: DirectInput8Create hands back IDirectInput8A or IDirectInput8W
+ * depending on the IID the caller asks for. The two have identical vtable layouts and
+ * differ only in the string types behind pointer parameters we forward untouched, so
+ * one wrapper serves both. BGE requests the ANSI interface.
+ *
  * Chaining
  * --------
  * As with the d3d9 proxy, only one file can be called dinput8.dll. If another wrapper is
@@ -34,8 +48,12 @@
  */
 
 #define WIN32_LEAN_AND_MEAN
+#define DIRECTINPUT_VERSION 0x0800
 #include <windows.h>
+#include <dinput.h>
+#include <xinput.h>
 #include <stdarg.h>
+#include <new>
 
 #define PTRV(p) ((unsigned)(UINT_PTR)(p))
 
@@ -43,108 +61,13 @@
  * d3d9_windowed.cpp. Referenced from DllMain so it is not optimised out. */
 static const char kProxyMarker[] = "BGEFIX_PROXY_V1";
 
-/* ------------------------------------------------------------------ DirectInput types */
-
-/* Declared locally so no DirectX SDK headers are required. */
-static const GUID kSysKeyboard =
-    { 0x6F1D2B61, 0xD5A0, 0x11CF, { 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00 } };
-static const GUID kSysMouse =
-    { 0x6F1D2B60, 0xD5A0, 0x11CF, { 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00 } };
-
-typedef struct {
-    DWORD dwOfs;
-    DWORD dwData;
-    DWORD dwTimeStamp;
-    DWORD dwSequence;
-    /* uAppData follows in DX8 (cbObjectData tells us whether it is present) */
-} DIOBJDATA;
-
-struct IDI8;
-struct IDIDev8;
-
-typedef struct {
-    HRESULT (STDMETHODCALLTYPE *QueryInterface)(IDI8*, const GUID*, void**);
-    ULONG   (STDMETHODCALLTYPE *AddRef)(IDI8*);
-    ULONG   (STDMETHODCALLTYPE *Release)(IDI8*);
-    HRESULT (STDMETHODCALLTYPE *CreateDevice)(IDI8*, const GUID*, IDIDev8**, void*);
-    HRESULT (STDMETHODCALLTYPE *EnumDevices)(IDI8*, DWORD, void*, void*, DWORD);
-    HRESULT (STDMETHODCALLTYPE *GetDeviceStatus)(IDI8*, const GUID*);
-    HRESULT (STDMETHODCALLTYPE *RunControlPanel)(IDI8*, HWND, DWORD);
-    HRESULT (STDMETHODCALLTYPE *Initialize)(IDI8*, HINSTANCE, DWORD);
-    HRESULT (STDMETHODCALLTYPE *FindDevice)(IDI8*, const GUID*, const void*, GUID*);
-    HRESULT (STDMETHODCALLTYPE *EnumDevicesBySemantics)(IDI8*, const void*, void*, void*, void*, DWORD);
-    HRESULT (STDMETHODCALLTYPE *ConfigureDevices)(IDI8*, void*, void*, DWORD, void*);
-} IDI8Vtbl;
-struct IDI8 { IDI8Vtbl* lpVtbl; };
-
-typedef struct {
-    HRESULT (STDMETHODCALLTYPE *QueryInterface)(IDIDev8*, const GUID*, void**);
-    ULONG   (STDMETHODCALLTYPE *AddRef)(IDIDev8*);
-    ULONG   (STDMETHODCALLTYPE *Release)(IDIDev8*);
-    HRESULT (STDMETHODCALLTYPE *GetCapabilities)(IDIDev8*, void*);
-    HRESULT (STDMETHODCALLTYPE *EnumObjects)(IDIDev8*, void*, void*, DWORD);
-    HRESULT (STDMETHODCALLTYPE *GetProperty)(IDIDev8*, const GUID*, void*);
-    HRESULT (STDMETHODCALLTYPE *SetProperty)(IDIDev8*, const GUID*, const void*);
-    HRESULT (STDMETHODCALLTYPE *Acquire)(IDIDev8*);
-    HRESULT (STDMETHODCALLTYPE *Unacquire)(IDIDev8*);
-    HRESULT (STDMETHODCALLTYPE *GetDeviceState)(IDIDev8*, DWORD, void*);
-    HRESULT (STDMETHODCALLTYPE *GetDeviceData)(IDIDev8*, DWORD, DIOBJDATA*, DWORD*, DWORD);
-    HRESULT (STDMETHODCALLTYPE *SetDataFormat)(IDIDev8*, const void*);
-    HRESULT (STDMETHODCALLTYPE *SetEventNotification)(IDIDev8*, HANDLE);
-    HRESULT (STDMETHODCALLTYPE *SetCooperativeLevel)(IDIDev8*, HWND, DWORD);
-    HRESULT (STDMETHODCALLTYPE *GetObjectInfo)(IDIDev8*, void*, DWORD, DWORD);
-    HRESULT (STDMETHODCALLTYPE *GetDeviceInfo)(IDIDev8*, void*);
-    HRESULT (STDMETHODCALLTYPE *RunControlPanel)(IDIDev8*, HWND, DWORD);
-    HRESULT (STDMETHODCALLTYPE *Initialize)(IDIDev8*, HINSTANCE, DWORD, const GUID*);
-    HRESULT (STDMETHODCALLTYPE *CreateEffect)(IDIDev8*, const GUID*, const void*, void**, void*);
-    HRESULT (STDMETHODCALLTYPE *EnumEffects)(IDIDev8*, void*, void*, DWORD);
-    HRESULT (STDMETHODCALLTYPE *GetEffectInfo)(IDIDev8*, void*, const GUID*);
-    HRESULT (STDMETHODCALLTYPE *GetForceFeedbackState)(IDIDev8*, DWORD*);
-    HRESULT (STDMETHODCALLTYPE *SendForceFeedbackCommand)(IDIDev8*, DWORD);
-    HRESULT (STDMETHODCALLTYPE *EnumCreatedEffectObjects)(IDIDev8*, void*, void*, DWORD);
-    HRESULT (STDMETHODCALLTYPE *Escape)(IDIDev8*, void*);
-    HRESULT (STDMETHODCALLTYPE *Poll)(IDIDev8*);
-    HRESULT (STDMETHODCALLTYPE *SendDeviceData)(IDIDev8*, DWORD, const void*, DWORD*, DWORD);
-    HRESULT (STDMETHODCALLTYPE *EnumEffectsInFile)(IDIDev8*, const void*, void*, void*, DWORD);
-    HRESULT (STDMETHODCALLTYPE *WriteEffectToFile)(IDIDev8*, const void*, DWORD, void*, DWORD);
-    HRESULT (STDMETHODCALLTYPE *BuildActionMap)(IDIDev8*, void*, const void*, DWORD);
-    HRESULT (STDMETHODCALLTYPE *SetActionMap)(IDIDev8*, void*, const void*, DWORD);
-    HRESULT (STDMETHODCALLTYPE *GetImageInfo)(IDIDev8*, void*);
-} IDIDev8Vtbl;
-struct IDIDev8 { IDIDev8Vtbl* lpVtbl; };
-
-typedef struct { IDI8Vtbl*    lpVtbl; IDI8*    real; } WrapDI;
-typedef struct { IDIDev8Vtbl* lpVtbl; IDIDev8* real; int isKeyboard; } WrapDev;
-
-/* ------------------------------------------------------------------ XInput */
-
-typedef struct {
-    WORD  wButtons;
-    BYTE  bLeftTrigger;
-    BYTE  bRightTrigger;
-    SHORT sThumbLX, sThumbLY, sThumbRX, sThumbRY;
-} XPAD;
-typedef struct { DWORD dwPacketNumber; XPAD Gamepad; } XSTATE;
-
-typedef DWORD (WINAPI *PFN_XInputGetState)(DWORD, XSTATE*);
-
-#define XB_DPAD_UP    0x0001
-#define XB_DPAD_DOWN  0x0002
-#define XB_DPAD_LEFT  0x0004
-#define XB_DPAD_RIGHT 0x0008
-#define XB_START      0x0010
-#define XB_BACK       0x0020
-#define XB_LTHUMB     0x0040
-#define XB_RTHUMB     0x0080
-#define XB_LB         0x0100
-#define XB_RB         0x0200
-#define XB_A          0x1000
-#define XB_B          0x2000
-#define XB_X          0x4000
-#define XB_Y          0x8000
-
 /* A mapping target: 0 = unmapped, MOUSE_BASE+n = mouse button n, else a DIK scan code. */
 #define MOUSE_BASE 0x1000
+
+/* Mouse button n lives at this byte offset in DIMOUSESTATE/DIMOUSESTATE2. */
+#define MOUSE_BTN_OFS(n) (FIELD_OFFSET(DIMOUSESTATE2, rgbButtons) + (n))
+
+typedef DWORD (WINAPI *PFN_XInputGetState)(DWORD, XINPUT_STATE*);
 
 /* ------------------------------------------------------------------ state */
 
@@ -356,29 +279,29 @@ static void PollPad(void)
     InitXInput();
     if (!g_XInputGetState) return;
 
-    XSTATE st;
+    XINPUT_STATE st;
     DWORD ok = ERROR_DEVICE_NOT_CONNECTED;
-    for (DWORD i = 0; i < 4; ++i) {
+    for (DWORD i = 0; i < XUSER_MAX_COUNT; ++i) {
         memset(&st, 0, sizeof(st));
         if (g_XInputGetState(i, &st) == ERROR_SUCCESS) { ok = ERROR_SUCCESS; break; }
     }
     if (ok != ERROR_SUCCESS) return;
 
     WORD b = st.Gamepad.wButtons;
-    if (b & XB_A)         Press(g_mA);
-    if (b & XB_B)         Press(g_mB);
-    if (b & XB_X)         Press(g_mX);
-    if (b & XB_Y)         Press(g_mY);
-    if (b & XB_LB)        Press(g_mLB);
-    if (b & XB_RB)        Press(g_mRB);
-    if (b & XB_START)     Press(g_mStart);
-    if (b & XB_BACK)      Press(g_mBack);
-    if (b & XB_LTHUMB)    Press(g_mLS);
-    if (b & XB_RTHUMB)    Press(g_mRS);
-    if (b & XB_DPAD_UP)   Press(g_mDU);
-    if (b & XB_DPAD_DOWN) Press(g_mDD);
-    if (b & XB_DPAD_LEFT) Press(g_mDL);
-    if (b & XB_DPAD_RIGHT)Press(g_mDR);
+    if (b & XINPUT_GAMEPAD_A)              Press(g_mA);
+    if (b & XINPUT_GAMEPAD_B)              Press(g_mB);
+    if (b & XINPUT_GAMEPAD_X)              Press(g_mX);
+    if (b & XINPUT_GAMEPAD_Y)              Press(g_mY);
+    if (b & XINPUT_GAMEPAD_LEFT_SHOULDER)  Press(g_mLB);
+    if (b & XINPUT_GAMEPAD_RIGHT_SHOULDER) Press(g_mRB);
+    if (b & XINPUT_GAMEPAD_START)          Press(g_mStart);
+    if (b & XINPUT_GAMEPAD_BACK)           Press(g_mBack);
+    if (b & XINPUT_GAMEPAD_LEFT_THUMB)     Press(g_mLS);
+    if (b & XINPUT_GAMEPAD_RIGHT_THUMB)    Press(g_mRS);
+    if (b & XINPUT_GAMEPAD_DPAD_UP)        Press(g_mDU);
+    if (b & XINPUT_GAMEPAD_DPAD_DOWN)      Press(g_mDD);
+    if (b & XINPUT_GAMEPAD_DPAD_LEFT)      Press(g_mDL);
+    if (b & XINPUT_GAMEPAD_DPAD_RIGHT)     Press(g_mDR);
 
     if (st.Gamepad.bLeftTrigger  > g_triggerThreshold) Press(g_mLT);
     if (st.Gamepad.bRightTrigger > g_triggerThreshold) Press(g_mRT);
@@ -391,8 +314,8 @@ static void PollPad(void)
     if (ly < -g_deadzone) Press(g_sDown);
 
     /* D-pad doubles as movement when not otherwise mapped. */
-    if ((b & XB_DPAD_UP)    && g_mDU == 0) Press(g_sUp);
-    if ((b & XB_DPAD_DOWN)  && g_mDD == 0) Press(g_sDown);
+    if ((b & XINPUT_GAMEPAD_DPAD_UP)   && g_mDU == 0) Press(g_sUp);
+    if ((b & XINPUT_GAMEPAD_DPAD_DOWN) && g_mDD == 0) Press(g_sDown);
 
     /* Right stick -> relative mouse motion, consumed by the mouse device wrapper. */
     int rx = st.Gamepad.sThumbRX, ry = st.Gamepad.sThumbRY;
@@ -406,205 +329,263 @@ static void PollPad(void)
 
 /* ------------------------------------------------------------------ device wrapper */
 
-#define DREAL(p) (((WrapDev*)(p))->real)
-#define DVT(p)   (DREAL(p)->lpVtbl)
-
-static HRESULT STDMETHODCALLTYPE D_QueryInterface(IDIDev8* s, const GUID* r, void** o)
+class DIDeviceProxy final : public IDirectInputDevice8A
 {
-    HRESULT hr = DVT(s)->QueryInterface(DREAL(s), r, o);
-    if (SUCCEEDED(hr) && o && *o == (void*)DREAL(s)) *o = s;
-    return hr;
-}
-static ULONG STDMETHODCALLTYPE D_AddRef(IDIDev8* s) { return DVT(s)->AddRef(DREAL(s)); }
-static ULONG STDMETHODCALLTYPE D_Release(IDIDev8* s)
-{
-    IDIDev8* r = DREAL(s);
-    ULONG n = r->lpVtbl->Release(r);
-    if (n == 0) HeapFree(GetProcessHeap(), 0, s);
-    return n;
-}
+public:
+    DIDeviceProxy(IDirectInputDevice8A* real, bool isKeyboard)
+        : real_(real), isKeyboard_(isKeyboard) {}
 
-static HRESULT STDMETHODCALLTYPE D_GetDeviceState(IDIDev8* s, DWORD cb, void* data)
-{
-    HRESULT hr = DVT(s)->GetDeviceState(DREAL(s), cb, data);
-    if (FAILED(hr) || !data) return hr;
+    /* --- IUnknown --- */
 
-    PollPad();
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override
+    {
+        HRESULT hr = real_->QueryInterface(riid, ppv);
+        if (SUCCEEDED(hr) && ppv && *ppv == (void*)real_)
+            *ppv = static_cast<IDirectInputDevice8A*>(this);
+        return hr;
+    }
 
-    if (((WrapDev*)s)->isKeyboard) {
-        if (cb >= 256) {
-            BYTE* k = (BYTE*)data;
-            for (int i = 0; i < 256; ++i) if (g_keys[i]) k[i] = 0x80;
+    ULONG STDMETHODCALLTYPE AddRef() override { return real_->AddRef(); }
+
+    ULONG STDMETHODCALLTYPE Release() override
+    {
+        ULONG n = real_->Release();
+        if (n == 0) {
+            this->~DIDeviceProxy();
+            HeapFree(GetProcessHeap(), 0, this);
         }
+        return n;
     }
-    else {
-        /* DIMOUSESTATE: LONG lX, lY, lZ; BYTE rgbButtons[4 or 8] */
-        if (cb >= 12) {
-            LONG* ax = (LONG*)data;
-            ax[0] += g_lookX;
-            ax[1] += g_lookY;
-            DWORD nb = cb - 12;
-            if (nb > 8) nb = 8;
-            BYTE* btn = (BYTE*)data + 12;
-            for (DWORD i = 0; i < nb; ++i) if (g_mouseBtn[i]) btn[i] = 0x80;
+
+    /* --- the two methods that inject controller state --- */
+
+    HRESULT STDMETHODCALLTYPE GetDeviceState(DWORD cb, LPVOID data) override
+    {
+        HRESULT hr = real_->GetDeviceState(cb, data);
+        if (FAILED(hr) || !data) return hr;
+
+        PollPad();
+
+        if (isKeyboard_) {
+            if (cb >= 256) {
+                BYTE* k = (BYTE*)data;
+                for (int i = 0; i < 256; ++i) if (g_keys[i]) k[i] = 0x80;
+            }
         }
-    }
-    return hr;
-}
-
-/* Buffered mode: synthesise press/release events for anything that changed since the
- * last poll, and append them after whatever the real device returned. */
-static HRESULT STDMETHODCALLTYPE D_GetDeviceData(IDIDev8* s, DWORD cbObj, DIOBJDATA* rgdod,
-                                                 DWORD* pdwInOut, DWORD flags)
-{
-    HRESULT hr = DVT(s)->GetDeviceData(DREAL(s), cbObj, rgdod, pdwInOut, flags);
-    if (FAILED(hr) || !pdwInOut) return hr;
-
-    /* Peek must not consume our synthetic events either. */
-    const BOOL peek = (flags & 1 /* DIGDD_PEEK */) != 0;
-    if (!rgdod) return hr;                      /* caller only wants a count */
-    if (cbObj < sizeof(DIOBJDATA)) return hr;
-
-    PollPad();
-
-    DWORD count = *pdwInOut;
-    DWORD cap   = count;                        /* on entry: buffer capacity */
-    DWORD used  = count;                        /* real device already filled this many */
-    if (used > cap) return hr;
-
-    BYTE* base = (BYTE*)rgdod;
-    BYTE  curB[8];
-    BYTE* cur;
-    BYTE* prev;
-    int   n;
-
-    if (((WrapDev*)s)->isKeyboard) { cur = g_keys; prev = g_prevKeys; n = 256; }
-    else {
-        memcpy(curB, g_mouseBtn, 8);
-        cur = curB; prev = g_prevMouseBtn; n = 8;
+        else {
+            /* DIMOUSESTATE: LONG lX, lY, lZ followed by rgbButtons[4]; DIMOUSESTATE2
+             * is identical with rgbButtons[8]. Accept either. */
+            const DWORD btnOfs = (DWORD)FIELD_OFFSET(DIMOUSESTATE2, rgbButtons);
+            if (cb >= btnOfs) {
+                LONG* ax = (LONG*)data;
+                ax[0] += g_lookX;
+                ax[1] += g_lookY;
+                DWORD nb = cb - btnOfs;
+                if (nb > sizeof(g_mouseBtn)) nb = sizeof(g_mouseBtn);
+                BYTE* btn = (BYTE*)data + btnOfs;
+                for (DWORD i = 0; i < nb; ++i) if (g_mouseBtn[i]) btn[i] = 0x80;
+            }
+        }
+        return hr;
     }
 
-    for (int i = 0; i < n && used < cap; ++i) {
-        if (cur[i] == prev[i]) continue;
-        DIOBJDATA* o = (DIOBJDATA*)(base + (size_t)used * cbObj);
-        /* Mouse button offsets in DIMOUSESTATE start at byte 12. */
-        o->dwOfs       = ((WrapDev*)s)->isKeyboard ? (DWORD)i : (DWORD)(12 + i);
-        o->dwData      = cur[i] ? 0x80 : 0x00;
-        o->dwTimeStamp = GetTickCount();
-        o->dwSequence  = g_seq++;
-        if (cbObj >= sizeof(DIOBJDATA) + sizeof(UINT_PTR))
-            *(UINT_PTR*)((BYTE*)o + sizeof(DIOBJDATA)) = 0;
-        used++;
+    /* Buffered mode: synthesise press/release events for anything that changed since the
+     * last poll, and append them after whatever the real device returned. */
+    HRESULT STDMETHODCALLTYPE GetDeviceData(DWORD cbObj, LPDIDEVICEOBJECTDATA rgdod,
+                                            LPDWORD pdwInOut, DWORD flags) override
+    {
+        HRESULT hr = real_->GetDeviceData(cbObj, rgdod, pdwInOut, flags);
+        if (FAILED(hr) || !pdwInOut) return hr;
+
+        /* Peek must not consume our synthetic events either. */
+        const BOOL peek = (flags & DIGDD_PEEK) != 0;
+        if (!rgdod) return hr;                      /* caller only wants a count */
+
+        /* A DX3-era caller passes the 16-byte struct; DX8 adds uAppData. */
+        if (cbObj < sizeof(DIDEVICEOBJECTDATA_DX3)) return hr;
+
+        PollPad();
+
+        DWORD count = *pdwInOut;
+        DWORD cap   = count;                        /* on entry: buffer capacity */
+        DWORD used  = count;                        /* real device already filled this many */
+        if (used > cap) return hr;
+
+        BYTE* base = (BYTE*)rgdod;
+        BYTE  curB[8];
+        BYTE* cur;
+        BYTE* prev;
+        int   n;
+
+        if (isKeyboard_) { cur = g_keys; prev = g_prevKeys; n = 256; }
+        else {
+            memcpy(curB, g_mouseBtn, sizeof(curB));
+            cur = curB; prev = g_prevMouseBtn; n = (int)sizeof(curB);
+        }
+
+        for (int i = 0; i < n && used < cap; ++i) {
+            if (cur[i] == prev[i]) continue;
+            DIDEVICEOBJECTDATA_DX3* o =
+                (DIDEVICEOBJECTDATA_DX3*)(base + (size_t)used * cbObj);
+            o->dwOfs       = isKeyboard_ ? (DWORD)i : (DWORD)MOUSE_BTN_OFS(i);
+            o->dwData      = cur[i] ? 0x80 : 0x00;
+            o->dwTimeStamp = GetTickCount();
+            o->dwSequence  = g_seq++;
+            if (cbObj >= sizeof(DIDEVICEOBJECTDATA))
+                ((DIDEVICEOBJECTDATA*)o)->uAppData = 0;
+            used++;
+        }
+
+        if (!peek) memcpy(prev, cur, (size_t)n);
+        *pdwInOut = used;
+        return hr;
     }
 
-    if (!peek) memcpy(prev, cur, n);
-    *pdwInOut = used;
-    return hr;
-}
+    /* --- everything else forwards untouched --- */
 
-static HRESULT STDMETHODCALLTYPE D_GetCapabilities(IDIDev8* s, void* a) { return DVT(s)->GetCapabilities(DREAL(s), a); }
-static HRESULT STDMETHODCALLTYPE D_EnumObjects(IDIDev8* s, void* a, void* b, DWORD c) { return DVT(s)->EnumObjects(DREAL(s), a, b, c); }
-static HRESULT STDMETHODCALLTYPE D_GetProperty(IDIDev8* s, const GUID* a, void* b) { return DVT(s)->GetProperty(DREAL(s), a, b); }
-static HRESULT STDMETHODCALLTYPE D_SetProperty(IDIDev8* s, const GUID* a, const void* b) { return DVT(s)->SetProperty(DREAL(s), a, b); }
-static HRESULT STDMETHODCALLTYPE D_Acquire(IDIDev8* s) { return DVT(s)->Acquire(DREAL(s)); }
-static HRESULT STDMETHODCALLTYPE D_Unacquire(IDIDev8* s) { return DVT(s)->Unacquire(DREAL(s)); }
-static HRESULT STDMETHODCALLTYPE D_SetDataFormat(IDIDev8* s, const void* a) { return DVT(s)->SetDataFormat(DREAL(s), a); }
-static HRESULT STDMETHODCALLTYPE D_SetEventNotification(IDIDev8* s, HANDLE a) { return DVT(s)->SetEventNotification(DREAL(s), a); }
-static HRESULT STDMETHODCALLTYPE D_SetCooperativeLevel(IDIDev8* s, HWND a, DWORD b) { return DVT(s)->SetCooperativeLevel(DREAL(s), a, b); }
-static HRESULT STDMETHODCALLTYPE D_GetObjectInfo(IDIDev8* s, void* a, DWORD b, DWORD c) { return DVT(s)->GetObjectInfo(DREAL(s), a, b, c); }
-static HRESULT STDMETHODCALLTYPE D_GetDeviceInfo(IDIDev8* s, void* a) { return DVT(s)->GetDeviceInfo(DREAL(s), a); }
-static HRESULT STDMETHODCALLTYPE D_RunControlPanel(IDIDev8* s, HWND a, DWORD b) { return DVT(s)->RunControlPanel(DREAL(s), a, b); }
-static HRESULT STDMETHODCALLTYPE D_Initialize(IDIDev8* s, HINSTANCE a, DWORD b, const GUID* c) { return DVT(s)->Initialize(DREAL(s), a, b, c); }
-static HRESULT STDMETHODCALLTYPE D_CreateEffect(IDIDev8* s, const GUID* a, const void* b, void** c, void* d) { return DVT(s)->CreateEffect(DREAL(s), a, b, c, d); }
-static HRESULT STDMETHODCALLTYPE D_EnumEffects(IDIDev8* s, void* a, void* b, DWORD c) { return DVT(s)->EnumEffects(DREAL(s), a, b, c); }
-static HRESULT STDMETHODCALLTYPE D_GetEffectInfo(IDIDev8* s, void* a, const GUID* b) { return DVT(s)->GetEffectInfo(DREAL(s), a, b); }
-static HRESULT STDMETHODCALLTYPE D_GetForceFeedbackState(IDIDev8* s, DWORD* a) { return DVT(s)->GetForceFeedbackState(DREAL(s), a); }
-static HRESULT STDMETHODCALLTYPE D_SendForceFeedbackCommand(IDIDev8* s, DWORD a) { return DVT(s)->SendForceFeedbackCommand(DREAL(s), a); }
-static HRESULT STDMETHODCALLTYPE D_EnumCreatedEffectObjects(IDIDev8* s, void* a, void* b, DWORD c) { return DVT(s)->EnumCreatedEffectObjects(DREAL(s), a, b, c); }
-static HRESULT STDMETHODCALLTYPE D_Escape(IDIDev8* s, void* a) { return DVT(s)->Escape(DREAL(s), a); }
-static HRESULT STDMETHODCALLTYPE D_Poll(IDIDev8* s) { return DVT(s)->Poll(DREAL(s)); }
-static HRESULT STDMETHODCALLTYPE D_SendDeviceData(IDIDev8* s, DWORD a, const void* b, DWORD* c, DWORD d) { return DVT(s)->SendDeviceData(DREAL(s), a, b, c, d); }
-static HRESULT STDMETHODCALLTYPE D_EnumEffectsInFile(IDIDev8* s, const void* a, void* b, void* c, DWORD d) { return DVT(s)->EnumEffectsInFile(DREAL(s), a, b, c, d); }
-static HRESULT STDMETHODCALLTYPE D_WriteEffectToFile(IDIDev8* s, const void* a, DWORD b, void* c, DWORD d) { return DVT(s)->WriteEffectToFile(DREAL(s), a, b, c, d); }
-static HRESULT STDMETHODCALLTYPE D_BuildActionMap(IDIDev8* s, void* a, const void* b, DWORD c) { return DVT(s)->BuildActionMap(DREAL(s), a, b, c); }
-static HRESULT STDMETHODCALLTYPE D_SetActionMap(IDIDev8* s, void* a, const void* b, DWORD c) { return DVT(s)->SetActionMap(DREAL(s), a, b, c); }
-static HRESULT STDMETHODCALLTYPE D_GetImageInfo(IDIDev8* s, void* a) { return DVT(s)->GetImageInfo(DREAL(s), a); }
+    HRESULT STDMETHODCALLTYPE GetCapabilities(LPDIDEVCAPS a) override
+    { return real_->GetCapabilities(a); }
+    HRESULT STDMETHODCALLTYPE EnumObjects(LPDIENUMDEVICEOBJECTSCALLBACKA a, LPVOID b, DWORD c) override
+    { return real_->EnumObjects(a, b, c); }
+    HRESULT STDMETHODCALLTYPE GetProperty(REFGUID a, LPDIPROPHEADER b) override
+    { return real_->GetProperty(a, b); }
+    HRESULT STDMETHODCALLTYPE SetProperty(REFGUID a, LPCDIPROPHEADER b) override
+    { return real_->SetProperty(a, b); }
+    HRESULT STDMETHODCALLTYPE Acquire() override
+    { return real_->Acquire(); }
+    HRESULT STDMETHODCALLTYPE Unacquire() override
+    { return real_->Unacquire(); }
+    HRESULT STDMETHODCALLTYPE SetDataFormat(LPCDIDATAFORMAT a) override
+    { return real_->SetDataFormat(a); }
+    HRESULT STDMETHODCALLTYPE SetEventNotification(HANDLE a) override
+    { return real_->SetEventNotification(a); }
+    HRESULT STDMETHODCALLTYPE SetCooperativeLevel(HWND a, DWORD b) override
+    { return real_->SetCooperativeLevel(a, b); }
+    HRESULT STDMETHODCALLTYPE GetObjectInfo(LPDIDEVICEOBJECTINSTANCEA a, DWORD b, DWORD c) override
+    { return real_->GetObjectInfo(a, b, c); }
+    HRESULT STDMETHODCALLTYPE GetDeviceInfo(LPDIDEVICEINSTANCEA a) override
+    { return real_->GetDeviceInfo(a); }
+    HRESULT STDMETHODCALLTYPE RunControlPanel(HWND a, DWORD b) override
+    { return real_->RunControlPanel(a, b); }
+    HRESULT STDMETHODCALLTYPE Initialize(HINSTANCE a, DWORD b, REFGUID c) override
+    { return real_->Initialize(a, b, c); }
+    HRESULT STDMETHODCALLTYPE CreateEffect(REFGUID a, LPCDIEFFECT b,
+                                           LPDIRECTINPUTEFFECT* c, LPUNKNOWN d) override
+    { return real_->CreateEffect(a, b, c, d); }
+    HRESULT STDMETHODCALLTYPE EnumEffects(LPDIENUMEFFECTSCALLBACKA a, LPVOID b, DWORD c) override
+    { return real_->EnumEffects(a, b, c); }
+    HRESULT STDMETHODCALLTYPE GetEffectInfo(LPDIEFFECTINFOA a, REFGUID b) override
+    { return real_->GetEffectInfo(a, b); }
+    HRESULT STDMETHODCALLTYPE GetForceFeedbackState(LPDWORD a) override
+    { return real_->GetForceFeedbackState(a); }
+    HRESULT STDMETHODCALLTYPE SendForceFeedbackCommand(DWORD a) override
+    { return real_->SendForceFeedbackCommand(a); }
+    HRESULT STDMETHODCALLTYPE EnumCreatedEffectObjects(LPDIENUMCREATEDEFFECTOBJECTSCALLBACK a,
+                                                       LPVOID b, DWORD c) override
+    { return real_->EnumCreatedEffectObjects(a, b, c); }
+    HRESULT STDMETHODCALLTYPE Escape(LPDIEFFESCAPE a) override
+    { return real_->Escape(a); }
+    HRESULT STDMETHODCALLTYPE Poll() override
+    { return real_->Poll(); }
+    HRESULT STDMETHODCALLTYPE SendDeviceData(DWORD a, LPCDIDEVICEOBJECTDATA b,
+                                             LPDWORD c, DWORD d) override
+    { return real_->SendDeviceData(a, b, c, d); }
+    HRESULT STDMETHODCALLTYPE EnumEffectsInFile(LPCSTR a, LPDIENUMEFFECTSINFILECALLBACK b,
+                                                LPVOID c, DWORD d) override
+    { return real_->EnumEffectsInFile(a, b, c, d); }
+    HRESULT STDMETHODCALLTYPE WriteEffectToFile(LPCSTR a, DWORD b, LPDIFILEEFFECT c, DWORD d) override
+    { return real_->WriteEffectToFile(a, b, c, d); }
+    HRESULT STDMETHODCALLTYPE BuildActionMap(LPDIACTIONFORMATA a, LPCSTR b, DWORD c) override
+    { return real_->BuildActionMap(a, b, c); }
+    HRESULT STDMETHODCALLTYPE SetActionMap(LPDIACTIONFORMATA a, LPCSTR b, DWORD c) override
+    { return real_->SetActionMap(a, b, c); }
+    HRESULT STDMETHODCALLTYPE GetImageInfo(LPDIDEVICEIMAGEINFOHEADERA a) override
+    { return real_->GetImageInfo(a); }
 
-static IDIDev8Vtbl g_devVtbl = {
-    D_QueryInterface, D_AddRef, D_Release,
-    D_GetCapabilities, D_EnumObjects, D_GetProperty, D_SetProperty,
-    D_Acquire, D_Unacquire, D_GetDeviceState, D_GetDeviceData,
-    D_SetDataFormat, D_SetEventNotification, D_SetCooperativeLevel,
-    D_GetObjectInfo, D_GetDeviceInfo, D_RunControlPanel, D_Initialize,
-    D_CreateEffect, D_EnumEffects, D_GetEffectInfo, D_GetForceFeedbackState,
-    D_SendForceFeedbackCommand, D_EnumCreatedEffectObjects, D_Escape, D_Poll,
-    D_SendDeviceData, D_EnumEffectsInFile, D_WriteEffectToFile,
-    D_BuildActionMap, D_SetActionMap, D_GetImageInfo
+private:
+    IDirectInputDevice8A* real_;
+    bool                  isKeyboard_;
 };
 
 /* ------------------------------------------------------------------ factory wrapper */
 
-#define IREAL(p) (((WrapDI*)(p))->real)
-#define IVT(p)   (IREAL(p)->lpVtbl)
-
-static HRESULT STDMETHODCALLTYPE I_QueryInterface(IDI8* s, const GUID* r, void** o)
+class DI8Proxy final : public IDirectInput8A
 {
-    HRESULT hr = IVT(s)->QueryInterface(IREAL(s), r, o);
-    if (SUCCEEDED(hr) && o && *o == (void*)IREAL(s)) *o = s;
-    return hr;
-}
-static ULONG STDMETHODCALLTYPE I_AddRef(IDI8* s) { return IVT(s)->AddRef(IREAL(s)); }
-static ULONG STDMETHODCALLTYPE I_Release(IDI8* s)
-{
-    IDI8* r = IREAL(s);
-    ULONG n = r->lpVtbl->Release(r);
-    if (n == 0) HeapFree(GetProcessHeap(), 0, s);
-    return n;
-}
+public:
+    explicit DI8Proxy(IDirectInput8A* real) : real_(real) {}
 
-static HRESULT STDMETHODCALLTYPE I_CreateDevice(IDI8* s, const GUID* rguid, IDIDev8** out, void* outer)
-{
-    HRESULT hr = IVT(s)->CreateDevice(IREAL(s), rguid, out, outer);
-    if (FAILED(hr) || !out || !*out || !rguid) return hr;
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override
+    {
+        HRESULT hr = real_->QueryInterface(riid, ppv);
+        if (SUCCEEDED(hr) && ppv && *ppv == (void*)real_)
+            *ppv = static_cast<IDirectInput8A*>(this);
+        return hr;
+    }
 
-    int isKb  = (memcmp(rguid, &kSysKeyboard, sizeof(GUID)) == 0);
-    int isMs  = (memcmp(rguid, &kSysMouse,    sizeof(GUID)) == 0);
-    if (!isKb && !isMs) return hr;               /* leave other devices alone */
+    ULONG STDMETHODCALLTYPE AddRef() override { return real_->AddRef(); }
 
-    WrapDev* w = (WrapDev*)HeapAlloc(GetProcessHeap(), 0, sizeof(WrapDev));
-    if (!w) return hr;
-    w->lpVtbl     = &g_devVtbl;
-    w->real       = *out;
-    w->isKeyboard = isKb;
-    *out = (IDIDev8*)w;
+    ULONG STDMETHODCALLTYPE Release() override
+    {
+        ULONG n = real_->Release();
+        if (n == 0) {
+            this->~DI8Proxy();
+            HeapFree(GetProcessHeap(), 0, this);
+        }
+        return n;
+    }
 
-    Log("[device] wrapped %s 0x%08X as 0x%08X", isKb ? "keyboard" : "mouse",
-        PTRV(w->real), PTRV(w));
-    return hr;
-}
+    HRESULT STDMETHODCALLTYPE CreateDevice(REFGUID rguid, LPDIRECTINPUTDEVICE8A* out,
+                                           LPUNKNOWN outer) override
+    {
+        HRESULT hr = real_->CreateDevice(rguid, out, outer);
+        if (FAILED(hr) || !out || !*out) return hr;
 
-static HRESULT STDMETHODCALLTYPE I_EnumDevices(IDI8* s, DWORD a, void* b, void* c, DWORD d) { return IVT(s)->EnumDevices(IREAL(s), a, b, c, d); }
-static HRESULT STDMETHODCALLTYPE I_GetDeviceStatus(IDI8* s, const GUID* a) { return IVT(s)->GetDeviceStatus(IREAL(s), a); }
-static HRESULT STDMETHODCALLTYPE I_RunControlPanel(IDI8* s, HWND a, DWORD b) { return IVT(s)->RunControlPanel(IREAL(s), a, b); }
-static HRESULT STDMETHODCALLTYPE I_Initialize(IDI8* s, HINSTANCE a, DWORD b) { return IVT(s)->Initialize(IREAL(s), a, b); }
-static HRESULT STDMETHODCALLTYPE I_FindDevice(IDI8* s, const GUID* a, const void* b, GUID* c) { return IVT(s)->FindDevice(IREAL(s), a, b, c); }
-static HRESULT STDMETHODCALLTYPE I_EnumDevicesBySemantics(IDI8* s, const void* a, void* b, void* c, void* d, DWORD e) { return IVT(s)->EnumDevicesBySemantics(IREAL(s), a, b, c, d, e); }
-static HRESULT STDMETHODCALLTYPE I_ConfigureDevices(IDI8* s, void* a, void* b, DWORD c, void* d) { return IVT(s)->ConfigureDevices(IREAL(s), a, b, c, d); }
+        const bool isKb = (IsEqualGUID(rguid, GUID_SysKeyboard) != 0);
+        const bool isMs = (IsEqualGUID(rguid, GUID_SysMouse) != 0);
+        if (!isKb && !isMs) return hr;               /* leave other devices alone */
 
-static IDI8Vtbl g_diVtbl = {
-    I_QueryInterface, I_AddRef, I_Release,
-    I_CreateDevice, I_EnumDevices, I_GetDeviceStatus, I_RunControlPanel,
-    I_Initialize, I_FindDevice, I_EnumDevicesBySemantics, I_ConfigureDevices
+        void* mem = HeapAlloc(GetProcessHeap(), 0, sizeof(DIDeviceProxy));
+        if (!mem) return hr;
+        DIDeviceProxy* w = new (mem) DIDeviceProxy(*out, isKb);
+
+        Log("[device] wrapped %s 0x%08X as 0x%08X", isKb ? "keyboard" : "mouse",
+            PTRV(*out), PTRV(w));
+        *out = w;
+        return hr;
+    }
+
+    HRESULT STDMETHODCALLTYPE EnumDevices(DWORD a, LPDIENUMDEVICESCALLBACKA b,
+                                          LPVOID c, DWORD d) override
+    { return real_->EnumDevices(a, b, c, d); }
+    HRESULT STDMETHODCALLTYPE GetDeviceStatus(REFGUID a) override
+    { return real_->GetDeviceStatus(a); }
+    HRESULT STDMETHODCALLTYPE RunControlPanel(HWND a, DWORD b) override
+    { return real_->RunControlPanel(a, b); }
+    HRESULT STDMETHODCALLTYPE Initialize(HINSTANCE a, DWORD b) override
+    { return real_->Initialize(a, b); }
+    HRESULT STDMETHODCALLTYPE FindDevice(REFGUID a, LPCSTR b, LPGUID c) override
+    { return real_->FindDevice(a, b, c); }
+    HRESULT STDMETHODCALLTYPE EnumDevicesBySemantics(LPCSTR a, LPDIACTIONFORMATA b,
+                                                     LPDIENUMDEVICESBYSEMANTICSCBA c,
+                                                     LPVOID d, DWORD e) override
+    { return real_->EnumDevicesBySemantics(a, b, c, d, e); }
+    HRESULT STDMETHODCALLTYPE ConfigureDevices(LPDICONFIGUREDEVICESCALLBACK a,
+                                               LPDICONFIGUREDEVICESPARAMSA b,
+                                               DWORD c, LPVOID d) override
+    { return real_->ConfigureDevices(a, b, c, d); }
+
+private:
+    IDirectInput8A* real_;
 };
 
 /* ------------------------------------------------------------------ exports */
 
 extern "C" {
 
-typedef HRESULT (WINAPI *PFN_DI8Create)(HINSTANCE, DWORD, const GUID*, void**, void*);
+typedef HRESULT (WINAPI *PFN_DI8Create)(HINSTANCE, DWORD, REFIID, LPVOID*, LPUNKNOWN);
 
-HRESULT WINAPI DirectInput8Create(HINSTANCE hinst, DWORD ver, const GUID* riid,
-                                  void** ppvOut, void* punkOuter)
+HRESULT WINAPI DirectInput8Create(HINSTANCE hinst, DWORD ver, REFIID riid,
+                                  LPVOID* ppvOut, LPUNKNOWN punkOuter)
 {
     LoadConfig();
 
@@ -615,14 +596,13 @@ HRESULT WINAPI DirectInput8Create(HINSTANCE hinst, DWORD ver, const GUID* riid,
     HRESULT hr = fn(hinst, ver, riid, ppvOut, punkOuter);
     if (FAILED(hr) || !ppvOut || !*ppvOut) return hr;
 
-    WrapDI* w = (WrapDI*)HeapAlloc(GetProcessHeap(), 0, sizeof(WrapDI));
-    if (!w) return hr;
-    w->lpVtbl = &g_diVtbl;
-    w->real   = (IDI8*)*ppvOut;
-    *ppvOut   = w;
+    void* mem = HeapAlloc(GetProcessHeap(), 0, sizeof(DI8Proxy));
+    if (!mem) return hr;
 
-    InitXInput();
-    Log("[init] wrapped IDirectInput8 0x%08X as 0x%08X", PTRV(w->real), PTRV(w));
+    /* IDirectInput8W has the same vtable layout, so the ANSI wrapper serves both. */
+    DI8Proxy* w = new (mem) DI8Proxy((IDirectInput8A*)*ppvOut);
+    Log("[init] wrapped IDirectInput8 0x%08X as 0x%08X", PTRV(*ppvOut), PTRV(w));
+    *ppvOut = w;
     return hr;
 }
 
@@ -633,9 +613,9 @@ HRESULT WINAPI DllCanUnloadNow(void)
     return fn ? fn() : S_FALSE;
 }
 
-HRESULT WINAPI DllGetClassObject(const GUID* a, const GUID* b, void** c)
+HRESULT WINAPI DllGetClassObject(REFCLSID a, REFIID b, LPVOID* c)
 {
-    typedef HRESULT (WINAPI *PFN)(const GUID*, const GUID*, void**);
+    typedef HRESULT (WINAPI *PFN)(REFCLSID, REFIID, LPVOID*);
     PFN fn = (PFN)(GetChain() ? GetProcAddress(GetChain(), "DllGetClassObject") : NULL);
     return fn ? fn(a, b, c) : E_NOTIMPL;
 }
@@ -654,9 +634,9 @@ HRESULT WINAPI DllUnregisterServer(void)
     return fn ? fn() : E_NOTIMPL;
 }
 
-LPCVOID WINAPI GetdfDIJoystick(void)
+LPCDIDATAFORMAT WINAPI GetdfDIJoystick(void)
 {
-    typedef LPCVOID (WINAPI *PFN)(void);
+    typedef LPCDIDATAFORMAT (WINAPI *PFN)(void);
     PFN fn = (PFN)(GetChain() ? GetProcAddress(GetChain(), "GetdfDIJoystick") : NULL);
     return fn ? fn() : NULL;
 }

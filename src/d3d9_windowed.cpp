@@ -13,12 +13,35 @@
  * not touch aspect ratio, resolution, FOV or shaders. Anything that does belongs in
  * a separate DLL chained behind this one (see below).
  *
- * No DirectX headers required
- * ---------------------------
- * We never call a D3D method by name, we only forward vtable slots. So instead of
- * pulling in d3d9.h (which is not part of a default Windows SDK install) we declare
- * the IDirect3D9 vtable layout and D3DPRESENT_PARAMETERS directly. Every parameter
- * on x86 is 4 bytes, so pointer-typed placeholders forward correctly under __stdcall.
+ * Both places the field is set
+ * ----------------------------
+ * A D3D9 application sets Windowed in two places, and intercepting only the first is a
+ * fix that quietly expires mid-session:
+ *
+ *   IDirect3D9::CreateDevice      - once, at startup
+ *   IDirect3DDevice9::Reset       - on device-lost recovery, and on any resolution or
+ *                                   display change made from the game's options
+ *
+ * If Reset is not intercepted, the game resets with Windowed = FALSE, goes back to
+ * exclusive fullscreen, and the HUD corruption this proxy exists to prevent returns.
+ * So the device returned by CreateDevice is wrapped too, and both call sites run the
+ * same ForceWindowed() edit. IDirect3DDevice9::CreateAdditionalSwapChain is a third
+ * entry point for present parameters and is covered for completeness.
+ *
+ * How the interfaces are modelled
+ * -------------------------------
+ * d3d9.h ships with the Windows SDK (under `shared\`, not `um\`), so the interfaces
+ * come from the header and the proxies simply derive from IDirect3D9 and
+ * IDirect3DDevice9. The compiler emits the vtables, which means slot order and every
+ * method signature are checked at compile time: adding, reordering or mistyping a
+ * method fails the build instead of calling through the wrong function pointer at
+ * runtime. IDirect3DDevice9 has 119 methods, of which four are interesting; the other
+ * 115 pass-through bodies were generated from the header rather than typed out.
+ *
+ * An earlier version of this file hand-declared the vtable to avoid the include. It
+ * got IDirect3D9::GetAdapterMonitor wrong - one parameter too many - which silently
+ * unbalanced the __stdcall stack on every call. Do not reintroduce hand-written
+ * interface layouts here.
  *
  * Chaining
  * --------
@@ -35,7 +58,9 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <d3d9.h>
 #include <stdarg.h>
+#include <new>
 
 /* wvsprintf supports only c C d i s S u x X - no %p and no %f. Pointers are logged
  * through this cast, which is exact because the DLL is 32-bit by construction. */
@@ -46,58 +71,6 @@
  * would chain the new proxy to the old one. Referenced from DllMain so it is not
  * optimised out of the binary. */
 static const char kProxyMarker[] = "BGEFIX_PROXY_V1";
-
-/* ------------------------------------------------------------------ D3D types */
-
-/* Exact layout of D3DPRESENT_PARAMETERS: 14 fields, all 4 bytes on x86. */
-typedef struct {
-    UINT  BackBufferWidth;
-    UINT  BackBufferHeight;
-    DWORD BackBufferFormat;
-    UINT  BackBufferCount;
-    DWORD MultiSampleType;
-    DWORD MultiSampleQuality;
-    DWORD SwapEffect;
-    HWND  hDeviceWindow;
-    BOOL  Windowed;
-    BOOL  EnableAutoDepthStencil;
-    DWORD AutoDepthStencilFormat;
-    DWORD Flags;
-    UINT  FullScreen_RefreshRateInHz;
-    UINT  PresentationInterval;
-} D3DPP;
-
-struct ID3D9;
-
-/* IDirect3D9 vtable. Order is fixed by the interface and must not change.
- * Types we never inspect are declared as 4-byte placeholders. */
-typedef struct {
-    HRESULT  (STDMETHODCALLTYPE *QueryInterface)(ID3D9*, const GUID*, void**);
-    ULONG    (STDMETHODCALLTYPE *AddRef)(ID3D9*);
-    ULONG    (STDMETHODCALLTYPE *Release)(ID3D9*);
-    HRESULT  (STDMETHODCALLTYPE *RegisterSoftwareDevice)(ID3D9*, void*);
-    UINT     (STDMETHODCALLTYPE *GetAdapterCount)(ID3D9*);
-    HRESULT  (STDMETHODCALLTYPE *GetAdapterIdentifier)(ID3D9*, UINT, DWORD, void*);
-    UINT     (STDMETHODCALLTYPE *GetAdapterModeCount)(ID3D9*, UINT, DWORD);
-    HRESULT  (STDMETHODCALLTYPE *EnumAdapterModes)(ID3D9*, UINT, DWORD, UINT, void*);
-    HRESULT  (STDMETHODCALLTYPE *GetAdapterDisplayMode)(ID3D9*, UINT, void*);
-    HRESULT  (STDMETHODCALLTYPE *CheckDeviceType)(ID3D9*, UINT, DWORD, DWORD, DWORD, BOOL);
-    HRESULT  (STDMETHODCALLTYPE *CheckDeviceFormat)(ID3D9*, UINT, DWORD, DWORD, DWORD, DWORD, DWORD);
-    HRESULT  (STDMETHODCALLTYPE *CheckDeviceMultiSampleType)(ID3D9*, UINT, DWORD, DWORD, BOOL, DWORD, DWORD*);
-    HRESULT  (STDMETHODCALLTYPE *CheckDepthStencilMatch)(ID3D9*, UINT, DWORD, DWORD, DWORD, DWORD);
-    HRESULT  (STDMETHODCALLTYPE *CheckDeviceFormatConversion)(ID3D9*, UINT, DWORD, DWORD, DWORD);
-    HRESULT  (STDMETHODCALLTYPE *GetDeviceCaps)(ID3D9*, UINT, DWORD, void*);
-    HMONITOR (STDMETHODCALLTYPE *GetAdapterMonitor)(ID3D9*, UINT, DWORD);
-    HRESULT  (STDMETHODCALLTYPE *CreateDevice)(ID3D9*, UINT, DWORD, HWND, DWORD, D3DPP*, void**);
-} ID3D9Vtbl;
-
-struct ID3D9 { ID3D9Vtbl* lpVtbl; };
-
-/* Our wrapper. lpVtbl must stay first so it is layout-compatible with ID3D9. */
-typedef struct {
-    ID3D9Vtbl* lpVtbl;
-    ID3D9*     real;
-} Wrapper;
 
 /* ------------------------------------------------------------------ state */
 
@@ -275,126 +248,520 @@ static void ApplyWindowMode(HWND hwnd, UINT bbW, UINT bbH)
         PTRV(hwnd), g_mode, x, y, w, h, bbW, bbH);
 }
 
-/* ------------------------------------------------------------------ vtable thunks */
+/* ------------------------------------------------------------------ the one edit */
 
-#define REAL(p) (((Wrapper*)(p))->real)
-#define VT(p)   (REAL(p)->lpVtbl)
-
-static HRESULT STDMETHODCALLTYPE W_QueryInterface(ID3D9* self, const GUID* riid, void** ppv)
+/* Rewrites a D3DPRESENT_PARAMETERS in place and restyles the presentation window.
+ * Returns the window that was targeted, so the caller can reassert afterwards.
+ *
+ * This must be applied at EVERY point a D3DPRESENT_PARAMETERS reaches the driver, not
+ * just at device creation. IDirect3DDevice9::Reset takes one too, and it is what a game
+ * calls on device-lost recovery and on any resolution change from an options menu. A
+ * proxy that only intercepts CreateDevice goes back to exclusive fullscreen the first
+ * time the game resets - which is exactly the state this DLL exists to prevent. */
+static HWND ForceWindowed(D3DPRESENT_PARAMETERS* pp, HWND fallback, const char* where)
 {
-    HRESULT hr = VT(self)->QueryInterface(REAL(self), riid, ppv);
-    /* Hand back the wrapper rather than the object it wraps. */
-    if (SUCCEEDED(hr) && ppv && *ppv == (void*)REAL(self)) *ppv = self;
-    return hr;
+    HWND target = fallback;
+    if (!pp) return target;
+
+    Log("[%s] requested windowed=%d %ux%u refresh=%u", where, pp->Windowed,
+        pp->BackBufferWidth, pp->BackBufferHeight, pp->FullScreen_RefreshRateInHz);
+
+    if (!pp->Windowed) {
+        pp->Windowed = TRUE;
+        /* Must be zero for a windowed device, else the call returns D3DERR_INVALIDCALL. */
+        pp->FullScreen_RefreshRateInHz = 0;
+    }
+    if (pp->hDeviceWindow) target = pp->hDeviceWindow;
+
+    /* In stretch mode the backbuffer stays at the game's resolution and D3D scales it
+     * to the client area on Present, so only the window changes. */
+    ApplyWindowMode(target, pp->BackBufferWidth, pp->BackBufferHeight);
+    return target;
 }
 
-static ULONG STDMETHODCALLTYPE W_AddRef(ID3D9* self)
+/* ------------------------------------------------------------------ device proxy */
+
+/* Wraps IDirect3DDevice9 for one reason: to intercept Reset. The other 118 methods are
+ * pure pass-through and were generated directly from the SDK's d3d9.h rather than typed
+ * out, then checked by the compiler - leaving one of them out, or getting a signature
+ * wrong, leaves the class abstract and fails the build. */
+class D3D9DeviceProxy final : public IDirect3DDevice9
 {
-    return VT(self)->AddRef(REAL(self));
-}
+public:
+    D3D9DeviceProxy(IDirect3DDevice9* real, IDirect3D9* parentProxy,
+                    IDirect3D9* parentReal, HWND focus)
+        : real_(real), parentProxy_(parentProxy), parentReal_(parentReal), focus_(focus) {}
 
-static ULONG STDMETHODCALLTYPE W_Release(ID3D9* self)
-{
-    ID3D9* real = REAL(self);
-    ULONG n = real->lpVtbl->Release(real);
-    if (n == 0) HeapFree(GetProcessHeap(), 0, self);
-    return n;
-}
+    /* --- IUnknown --- */
 
-static HRESULT STDMETHODCALLTYPE W_RegisterSoftwareDevice(ID3D9* s, void* a)
-{ return VT(s)->RegisterSoftwareDevice(REAL(s), a); }
-
-static UINT STDMETHODCALLTYPE W_GetAdapterCount(ID3D9* s)
-{ return VT(s)->GetAdapterCount(REAL(s)); }
-
-static HRESULT STDMETHODCALLTYPE W_GetAdapterIdentifier(ID3D9* s, UINT a, DWORD f, void* p)
-{ return VT(s)->GetAdapterIdentifier(REAL(s), a, f, p); }
-
-static UINT STDMETHODCALLTYPE W_GetAdapterModeCount(ID3D9* s, UINT a, DWORD f)
-{ return VT(s)->GetAdapterModeCount(REAL(s), a, f); }
-
-static HRESULT STDMETHODCALLTYPE W_EnumAdapterModes(ID3D9* s, UINT a, DWORD f, UINT m, void* p)
-{ return VT(s)->EnumAdapterModes(REAL(s), a, f, m, p); }
-
-static HRESULT STDMETHODCALLTYPE W_GetAdapterDisplayMode(ID3D9* s, UINT a, void* p)
-{ return VT(s)->GetAdapterDisplayMode(REAL(s), a, p); }
-
-static HRESULT STDMETHODCALLTYPE W_CheckDeviceType(ID3D9* s, UINT a, DWORD d, DWORD af, DWORD bf, BOOL w)
-{
-    /* The game asks whether its fullscreen combination is supported. Answer for the
-     * windowed case we are actually going to create, or it may bail before CreateDevice. */
-    UNREFERENCED_PARAMETER(w);
-    return VT(s)->CheckDeviceType(REAL(s), a, d, af, bf, TRUE);
-}
-
-static HRESULT STDMETHODCALLTYPE W_CheckDeviceFormat(ID3D9* s, UINT a, DWORD d, DWORD af, DWORD u, DWORD rt, DWORD cf)
-{ return VT(s)->CheckDeviceFormat(REAL(s), a, d, af, u, rt, cf); }
-
-static HRESULT STDMETHODCALLTYPE W_CheckDeviceMultiSampleType(ID3D9* s, UINT a, DWORD d, DWORD sf, BOOL w, DWORD mst, DWORD* q)
-{ return VT(s)->CheckDeviceMultiSampleType(REAL(s), a, d, sf, w, mst, q); }
-
-static HRESULT STDMETHODCALLTYPE W_CheckDepthStencilMatch(ID3D9* s, UINT a, DWORD d, DWORD af, DWORD rf, DWORD df)
-{ return VT(s)->CheckDepthStencilMatch(REAL(s), a, d, af, rf, df); }
-
-static HRESULT STDMETHODCALLTYPE W_CheckDeviceFormatConversion(ID3D9* s, UINT a, DWORD d, DWORD sf, DWORD tf)
-{ return VT(s)->CheckDeviceFormatConversion(REAL(s), a, d, sf, tf); }
-
-static HRESULT STDMETHODCALLTYPE W_GetDeviceCaps(ID3D9* s, UINT a, DWORD d, void* c)
-{ return VT(s)->GetDeviceCaps(REAL(s), a, d, c); }
-
-static HMONITOR STDMETHODCALLTYPE W_GetAdapterMonitor(ID3D9* s, UINT a, DWORD d)
-{ return VT(s)->GetAdapterMonitor(REAL(s), a, d); }
-
-/* The entire point of this DLL. */
-static HRESULT STDMETHODCALLTYPE W_CreateDevice(ID3D9* s, UINT adapter, DWORD devType,
-                                                HWND hFocus, DWORD behaviour,
-                                                D3DPP* pp, void** ppDevice)
-{
-    HWND target = hFocus;
-
-    if (pp) {
-        Log("[create] requested windowed=%d %ux%u refresh=%u",
-            pp->Windowed, pp->BackBufferWidth, pp->BackBufferHeight,
-            pp->FullScreen_RefreshRateInHz);
-
-        if (!pp->Windowed) {
-            pp->Windowed = TRUE;
-            /* Must be zero for a windowed device, else CreateDevice returns D3DERR_INVALIDCALL. */
-            pp->FullScreen_RefreshRateInHz = 0;
-        }
-        if (pp->hDeviceWindow) target = pp->hDeviceWindow;
-
-        /* In stretch mode the backbuffer stays at the game's resolution and D3D
-         * scales it to the client area on Present, so only the window changes. */
-        ApplyWindowMode(target, pp->BackBufferWidth, pp->BackBufferHeight);
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override
+    {
+        HRESULT hr = real_->QueryInterface(riid, ppv);
+        if (SUCCEEDED(hr) && ppv && *ppv == (void*)real_)
+            *ppv = static_cast<IDirect3DDevice9*>(this);
+        return hr;
     }
 
-    HRESULT hr = VT(s)->CreateDevice(REAL(s), adapter, devType, hFocus, behaviour, pp, ppDevice);
-    Log("[create] result=0x%08X", hr);
+    ULONG STDMETHODCALLTYPE AddRef() override { return real_->AddRef(); }
 
-    /* Some drivers resize the window during device creation; reassert afterwards. */
-    if (SUCCEEDED(hr) && pp)
-        ApplyWindowMode(target, pp->BackBufferWidth, pp->BackBufferHeight);
+    ULONG STDMETHODCALLTYPE Release() override
+    {
+        ULONG n = real_->Release();
+        if (n == 0) {
+            this->~D3D9DeviceProxy();
+            HeapFree(GetProcessHeap(), 0, this);
+        }
+        return n;
+    }
 
-    return hr;
-}
+    /* --- the second place Windowed gets set --- */
 
-static ID3D9Vtbl g_vtbl = {
-    W_QueryInterface, W_AddRef, W_Release,
-    W_RegisterSoftwareDevice, W_GetAdapterCount, W_GetAdapterIdentifier,
-    W_GetAdapterModeCount, W_EnumAdapterModes, W_GetAdapterDisplayMode,
-    W_CheckDeviceType, W_CheckDeviceFormat, W_CheckDeviceMultiSampleType,
-    W_CheckDepthStencilMatch, W_CheckDeviceFormatConversion, W_GetDeviceCaps,
-    W_GetAdapterMonitor, W_CreateDevice
+    HRESULT STDMETHODCALLTYPE Reset(D3DPRESENT_PARAMETERS* pp) override
+    {
+        HWND target = ForceWindowed(pp, focus_, "reset");
+
+        HRESULT hr = real_->Reset(pp);
+        Log("[reset] result=0x%08X", hr);
+
+        /* Reset re-establishes the swap chain, and a driver may resize or restore the
+         * window while doing so. Reassert, exactly as after CreateDevice. */
+        if (SUCCEEDED(hr) && pp)
+            ApplyWindowMode(target, pp->BackBufferWidth, pp->BackBufferHeight);
+
+        return hr;
+    }
+
+    /* D3D9 only permits windowed additional swap chains, so this is normally a no-op -
+     * but it is a third D3DPRESENT_PARAMETERS entry point, so the invariant is applied
+     * here too. No restyle: a secondary swap chain is not the presentation window. */
+    HRESULT STDMETHODCALLTYPE CreateAdditionalSwapChain(D3DPRESENT_PARAMETERS* pp,
+                                                        IDirect3DSwapChain9** sc) override
+    {
+        if (pp && !pp->Windowed) {
+            Log("[swapchain] forcing windowed on additional swap chain");
+            pp->Windowed = TRUE;
+            pp->FullScreen_RefreshRateInHz = 0;
+        }
+        return real_->CreateAdditionalSwapChain(pp, sc);
+    }
+
+    /* Hand back our factory wrapper, so a caller cannot reach the unwrapped IDirect3D9
+     * through the device and create a fullscreen device behind our back. The device
+     * holds a reference to its IDirect3D9, so parentProxy_ outlives this object. */
+    HRESULT STDMETHODCALLTYPE GetDirect3D(IDirect3D9** ppD3D9) override
+    {
+        HRESULT hr = real_->GetDirect3D(ppD3D9);
+        if (SUCCEEDED(hr) && ppD3D9 && *ppD3D9 == parentReal_) *ppD3D9 = parentProxy_;
+        return hr;
+    }
+
+    /* --- generated pass-through: see scripts note above --- */
+
+    HRESULT STDMETHODCALLTYPE TestCooperativeLevel() override
+    { return real_->TestCooperativeLevel(); }
+    UINT STDMETHODCALLTYPE GetAvailableTextureMem() override
+    { return real_->GetAvailableTextureMem(); }
+    HRESULT STDMETHODCALLTYPE EvictManagedResources() override
+    { return real_->EvictManagedResources(); }
+    HRESULT STDMETHODCALLTYPE GetDeviceCaps(D3DCAPS9* a0) override
+    { return real_->GetDeviceCaps(a0); }
+    HRESULT STDMETHODCALLTYPE GetDisplayMode(UINT a0, D3DDISPLAYMODE* a1) override
+    { return real_->GetDisplayMode(a0, a1); }
+    HRESULT STDMETHODCALLTYPE GetCreationParameters(D3DDEVICE_CREATION_PARAMETERS* a0) override
+    { return real_->GetCreationParameters(a0); }
+    HRESULT STDMETHODCALLTYPE SetCursorProperties(UINT a0, UINT a1, IDirect3DSurface9* a2) override
+    { return real_->SetCursorProperties(a0, a1, a2); }
+    void STDMETHODCALLTYPE SetCursorPosition(int a0, int a1, DWORD a2) override
+    { real_->SetCursorPosition(a0, a1, a2); }
+    BOOL STDMETHODCALLTYPE ShowCursor(BOOL a0) override
+    { return real_->ShowCursor(a0); }
+    HRESULT STDMETHODCALLTYPE GetSwapChain(UINT a0, IDirect3DSwapChain9** a1) override
+    { return real_->GetSwapChain(a0, a1); }
+    UINT STDMETHODCALLTYPE GetNumberOfSwapChains() override
+    { return real_->GetNumberOfSwapChains(); }
+    HRESULT STDMETHODCALLTYPE Present(CONST RECT* a0, CONST RECT* a1, HWND a2,
+                                      CONST RGNDATA* a3) override
+    { return real_->Present(a0, a1, a2, a3); }
+    HRESULT STDMETHODCALLTYPE GetBackBuffer(UINT a0, UINT a1, D3DBACKBUFFER_TYPE a2,
+                                            IDirect3DSurface9** a3) override
+    { return real_->GetBackBuffer(a0, a1, a2, a3); }
+    HRESULT STDMETHODCALLTYPE GetRasterStatus(UINT a0, D3DRASTER_STATUS* a1) override
+    { return real_->GetRasterStatus(a0, a1); }
+    HRESULT STDMETHODCALLTYPE SetDialogBoxMode(BOOL a0) override
+    { return real_->SetDialogBoxMode(a0); }
+    void STDMETHODCALLTYPE SetGammaRamp(UINT a0, DWORD a1, CONST D3DGAMMARAMP* a2) override
+    { real_->SetGammaRamp(a0, a1, a2); }
+    void STDMETHODCALLTYPE GetGammaRamp(UINT a0, D3DGAMMARAMP* a1) override
+    { real_->GetGammaRamp(a0, a1); }
+    HRESULT STDMETHODCALLTYPE CreateTexture(UINT a0, UINT a1, UINT a2, DWORD a3, D3DFORMAT a4,
+                                            D3DPOOL a5, IDirect3DTexture9** a6, HANDLE* a7) override
+    { return real_->CreateTexture(a0, a1, a2, a3, a4, a5, a6, a7); }
+    HRESULT STDMETHODCALLTYPE CreateVolumeTexture(UINT a0, UINT a1, UINT a2, UINT a3, DWORD a4,
+                                                  D3DFORMAT a5, D3DPOOL a6,
+                                                  IDirect3DVolumeTexture9** a7, HANDLE* a8) override
+    { return real_->CreateVolumeTexture(a0, a1, a2, a3, a4, a5, a6, a7, a8); }
+    HRESULT STDMETHODCALLTYPE CreateCubeTexture(UINT a0, UINT a1, DWORD a2, D3DFORMAT a3,
+                                                D3DPOOL a4, IDirect3DCubeTexture9** a5,
+                                                HANDLE* a6) override
+    { return real_->CreateCubeTexture(a0, a1, a2, a3, a4, a5, a6); }
+    HRESULT STDMETHODCALLTYPE CreateVertexBuffer(UINT a0, DWORD a1, DWORD a2, D3DPOOL a3,
+                                                 IDirect3DVertexBuffer9** a4, HANDLE* a5) override
+    { return real_->CreateVertexBuffer(a0, a1, a2, a3, a4, a5); }
+    HRESULT STDMETHODCALLTYPE CreateIndexBuffer(UINT a0, DWORD a1, D3DFORMAT a2, D3DPOOL a3,
+                                                IDirect3DIndexBuffer9** a4, HANDLE* a5) override
+    { return real_->CreateIndexBuffer(a0, a1, a2, a3, a4, a5); }
+    HRESULT STDMETHODCALLTYPE CreateRenderTarget(UINT a0, UINT a1, D3DFORMAT a2,
+                                                 D3DMULTISAMPLE_TYPE a3, DWORD a4, BOOL a5,
+                                                 IDirect3DSurface9** a6, HANDLE* a7) override
+    { return real_->CreateRenderTarget(a0, a1, a2, a3, a4, a5, a6, a7); }
+    HRESULT STDMETHODCALLTYPE CreateDepthStencilSurface(UINT a0, UINT a1, D3DFORMAT a2,
+                                                        D3DMULTISAMPLE_TYPE a3, DWORD a4,
+                                                        BOOL a5, IDirect3DSurface9** a6,
+                                                        HANDLE* a7) override
+    { return real_->CreateDepthStencilSurface(a0, a1, a2, a3, a4, a5, a6, a7); }
+    HRESULT STDMETHODCALLTYPE UpdateSurface(IDirect3DSurface9* a0, CONST RECT* a1,
+                                            IDirect3DSurface9* a2, CONST POINT* a3) override
+    { return real_->UpdateSurface(a0, a1, a2, a3); }
+    HRESULT STDMETHODCALLTYPE UpdateTexture(IDirect3DBaseTexture9* a0,
+                                            IDirect3DBaseTexture9* a1) override
+    { return real_->UpdateTexture(a0, a1); }
+    HRESULT STDMETHODCALLTYPE GetRenderTargetData(IDirect3DSurface9* a0, IDirect3DSurface9* a1) override
+    { return real_->GetRenderTargetData(a0, a1); }
+    HRESULT STDMETHODCALLTYPE GetFrontBufferData(UINT a0, IDirect3DSurface9* a1) override
+    { return real_->GetFrontBufferData(a0, a1); }
+    HRESULT STDMETHODCALLTYPE StretchRect(IDirect3DSurface9* a0, CONST RECT* a1,
+                                          IDirect3DSurface9* a2, CONST RECT* a3,
+                                          D3DTEXTUREFILTERTYPE a4) override
+    { return real_->StretchRect(a0, a1, a2, a3, a4); }
+    HRESULT STDMETHODCALLTYPE ColorFill(IDirect3DSurface9* a0, CONST RECT* a1, D3DCOLOR a2) override
+    { return real_->ColorFill(a0, a1, a2); }
+    HRESULT STDMETHODCALLTYPE CreateOffscreenPlainSurface(UINT a0, UINT a1, D3DFORMAT a2,
+                                                          D3DPOOL a3, IDirect3DSurface9** a4,
+                                                          HANDLE* a5) override
+    { return real_->CreateOffscreenPlainSurface(a0, a1, a2, a3, a4, a5); }
+    HRESULT STDMETHODCALLTYPE SetRenderTarget(DWORD a0, IDirect3DSurface9* a1) override
+    { return real_->SetRenderTarget(a0, a1); }
+    HRESULT STDMETHODCALLTYPE GetRenderTarget(DWORD a0, IDirect3DSurface9** a1) override
+    { return real_->GetRenderTarget(a0, a1); }
+    HRESULT STDMETHODCALLTYPE SetDepthStencilSurface(IDirect3DSurface9* a0) override
+    { return real_->SetDepthStencilSurface(a0); }
+    HRESULT STDMETHODCALLTYPE GetDepthStencilSurface(IDirect3DSurface9** a0) override
+    { return real_->GetDepthStencilSurface(a0); }
+    HRESULT STDMETHODCALLTYPE BeginScene() override
+    { return real_->BeginScene(); }
+    HRESULT STDMETHODCALLTYPE EndScene() override
+    { return real_->EndScene(); }
+    HRESULT STDMETHODCALLTYPE Clear(DWORD a0, CONST D3DRECT* a1, DWORD a2, D3DCOLOR a3,
+                                    float a4, DWORD a5) override
+    { return real_->Clear(a0, a1, a2, a3, a4, a5); }
+    HRESULT STDMETHODCALLTYPE SetTransform(D3DTRANSFORMSTATETYPE a0, CONST D3DMATRIX* a1) override
+    { return real_->SetTransform(a0, a1); }
+    HRESULT STDMETHODCALLTYPE GetTransform(D3DTRANSFORMSTATETYPE a0, D3DMATRIX* a1) override
+    { return real_->GetTransform(a0, a1); }
+    HRESULT STDMETHODCALLTYPE MultiplyTransform(D3DTRANSFORMSTATETYPE a0, CONST D3DMATRIX* a1) override
+    { return real_->MultiplyTransform(a0, a1); }
+    HRESULT STDMETHODCALLTYPE SetViewport(CONST D3DVIEWPORT9* a0) override
+    { return real_->SetViewport(a0); }
+    HRESULT STDMETHODCALLTYPE GetViewport(D3DVIEWPORT9* a0) override
+    { return real_->GetViewport(a0); }
+    HRESULT STDMETHODCALLTYPE SetMaterial(CONST D3DMATERIAL9* a0) override
+    { return real_->SetMaterial(a0); }
+    HRESULT STDMETHODCALLTYPE GetMaterial(D3DMATERIAL9* a0) override
+    { return real_->GetMaterial(a0); }
+    HRESULT STDMETHODCALLTYPE SetLight(DWORD a0, CONST D3DLIGHT9* a1) override
+    { return real_->SetLight(a0, a1); }
+    HRESULT STDMETHODCALLTYPE GetLight(DWORD a0, D3DLIGHT9* a1) override
+    { return real_->GetLight(a0, a1); }
+    HRESULT STDMETHODCALLTYPE LightEnable(DWORD a0, BOOL a1) override
+    { return real_->LightEnable(a0, a1); }
+    HRESULT STDMETHODCALLTYPE GetLightEnable(DWORD a0, BOOL* a1) override
+    { return real_->GetLightEnable(a0, a1); }
+    HRESULT STDMETHODCALLTYPE SetClipPlane(DWORD a0, CONST float* a1) override
+    { return real_->SetClipPlane(a0, a1); }
+    HRESULT STDMETHODCALLTYPE GetClipPlane(DWORD a0, float* a1) override
+    { return real_->GetClipPlane(a0, a1); }
+    HRESULT STDMETHODCALLTYPE SetRenderState(D3DRENDERSTATETYPE a0, DWORD a1) override
+    { return real_->SetRenderState(a0, a1); }
+    HRESULT STDMETHODCALLTYPE GetRenderState(D3DRENDERSTATETYPE a0, DWORD* a1) override
+    { return real_->GetRenderState(a0, a1); }
+    HRESULT STDMETHODCALLTYPE CreateStateBlock(D3DSTATEBLOCKTYPE a0, IDirect3DStateBlock9** a1) override
+    { return real_->CreateStateBlock(a0, a1); }
+    HRESULT STDMETHODCALLTYPE BeginStateBlock() override
+    { return real_->BeginStateBlock(); }
+    HRESULT STDMETHODCALLTYPE EndStateBlock(IDirect3DStateBlock9** a0) override
+    { return real_->EndStateBlock(a0); }
+    HRESULT STDMETHODCALLTYPE SetClipStatus(CONST D3DCLIPSTATUS9* a0) override
+    { return real_->SetClipStatus(a0); }
+    HRESULT STDMETHODCALLTYPE GetClipStatus(D3DCLIPSTATUS9* a0) override
+    { return real_->GetClipStatus(a0); }
+    HRESULT STDMETHODCALLTYPE GetTexture(DWORD a0, IDirect3DBaseTexture9** a1) override
+    { return real_->GetTexture(a0, a1); }
+    HRESULT STDMETHODCALLTYPE SetTexture(DWORD a0, IDirect3DBaseTexture9* a1) override
+    { return real_->SetTexture(a0, a1); }
+    HRESULT STDMETHODCALLTYPE GetTextureStageState(DWORD a0, D3DTEXTURESTAGESTATETYPE a1,
+                                                   DWORD* a2) override
+    { return real_->GetTextureStageState(a0, a1, a2); }
+    HRESULT STDMETHODCALLTYPE SetTextureStageState(DWORD a0, D3DTEXTURESTAGESTATETYPE a1,
+                                                   DWORD a2) override
+    { return real_->SetTextureStageState(a0, a1, a2); }
+    HRESULT STDMETHODCALLTYPE GetSamplerState(DWORD a0, D3DSAMPLERSTATETYPE a1, DWORD* a2) override
+    { return real_->GetSamplerState(a0, a1, a2); }
+    HRESULT STDMETHODCALLTYPE SetSamplerState(DWORD a0, D3DSAMPLERSTATETYPE a1, DWORD a2) override
+    { return real_->SetSamplerState(a0, a1, a2); }
+    HRESULT STDMETHODCALLTYPE ValidateDevice(DWORD* a0) override
+    { return real_->ValidateDevice(a0); }
+    HRESULT STDMETHODCALLTYPE SetPaletteEntries(UINT a0, CONST PALETTEENTRY* a1) override
+    { return real_->SetPaletteEntries(a0, a1); }
+    HRESULT STDMETHODCALLTYPE GetPaletteEntries(UINT a0, PALETTEENTRY* a1) override
+    { return real_->GetPaletteEntries(a0, a1); }
+    HRESULT STDMETHODCALLTYPE SetCurrentTexturePalette(UINT a0) override
+    { return real_->SetCurrentTexturePalette(a0); }
+    HRESULT STDMETHODCALLTYPE GetCurrentTexturePalette(UINT* a0) override
+    { return real_->GetCurrentTexturePalette(a0); }
+    HRESULT STDMETHODCALLTYPE SetScissorRect(CONST RECT* a0) override
+    { return real_->SetScissorRect(a0); }
+    HRESULT STDMETHODCALLTYPE GetScissorRect(RECT* a0) override
+    { return real_->GetScissorRect(a0); }
+    HRESULT STDMETHODCALLTYPE SetSoftwareVertexProcessing(BOOL a0) override
+    { return real_->SetSoftwareVertexProcessing(a0); }
+    BOOL STDMETHODCALLTYPE GetSoftwareVertexProcessing() override
+    { return real_->GetSoftwareVertexProcessing(); }
+    HRESULT STDMETHODCALLTYPE SetNPatchMode(float a0) override
+    { return real_->SetNPatchMode(a0); }
+    float STDMETHODCALLTYPE GetNPatchMode() override
+    { return real_->GetNPatchMode(); }
+    HRESULT STDMETHODCALLTYPE DrawPrimitive(D3DPRIMITIVETYPE a0, UINT a1, UINT a2) override
+    { return real_->DrawPrimitive(a0, a1, a2); }
+    HRESULT STDMETHODCALLTYPE DrawIndexedPrimitive(D3DPRIMITIVETYPE a0, INT a1, UINT a2,
+                                                   UINT a3, UINT a4, UINT a5) override
+    { return real_->DrawIndexedPrimitive(a0, a1, a2, a3, a4, a5); }
+    HRESULT STDMETHODCALLTYPE DrawPrimitiveUP(D3DPRIMITIVETYPE a0, UINT a1, CONST void* a2,
+                                              UINT a3) override
+    { return real_->DrawPrimitiveUP(a0, a1, a2, a3); }
+    HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveUP(D3DPRIMITIVETYPE a0, UINT a1, UINT a2,
+                                                     UINT a3, CONST void* a4, D3DFORMAT a5,
+                                                     CONST void* a6, UINT a7) override
+    { return real_->DrawIndexedPrimitiveUP(a0, a1, a2, a3, a4, a5, a6, a7); }
+    HRESULT STDMETHODCALLTYPE ProcessVertices(UINT a0, UINT a1, UINT a2,
+                                              IDirect3DVertexBuffer9* a3,
+                                              IDirect3DVertexDeclaration9* a4, DWORD a5) override
+    { return real_->ProcessVertices(a0, a1, a2, a3, a4, a5); }
+    HRESULT STDMETHODCALLTYPE CreateVertexDeclaration(CONST D3DVERTEXELEMENT9* a0,
+                                                      IDirect3DVertexDeclaration9** a1) override
+    { return real_->CreateVertexDeclaration(a0, a1); }
+    HRESULT STDMETHODCALLTYPE SetVertexDeclaration(IDirect3DVertexDeclaration9* a0) override
+    { return real_->SetVertexDeclaration(a0); }
+    HRESULT STDMETHODCALLTYPE GetVertexDeclaration(IDirect3DVertexDeclaration9** a0) override
+    { return real_->GetVertexDeclaration(a0); }
+    HRESULT STDMETHODCALLTYPE SetFVF(DWORD a0) override
+    { return real_->SetFVF(a0); }
+    HRESULT STDMETHODCALLTYPE GetFVF(DWORD* a0) override
+    { return real_->GetFVF(a0); }
+    HRESULT STDMETHODCALLTYPE CreateVertexShader(CONST DWORD* a0, IDirect3DVertexShader9** a1) override
+    { return real_->CreateVertexShader(a0, a1); }
+    HRESULT STDMETHODCALLTYPE SetVertexShader(IDirect3DVertexShader9* a0) override
+    { return real_->SetVertexShader(a0); }
+    HRESULT STDMETHODCALLTYPE GetVertexShader(IDirect3DVertexShader9** a0) override
+    { return real_->GetVertexShader(a0); }
+    HRESULT STDMETHODCALLTYPE SetVertexShaderConstantF(UINT a0, CONST float* a1, UINT a2) override
+    { return real_->SetVertexShaderConstantF(a0, a1, a2); }
+    HRESULT STDMETHODCALLTYPE GetVertexShaderConstantF(UINT a0, float* a1, UINT a2) override
+    { return real_->GetVertexShaderConstantF(a0, a1, a2); }
+    HRESULT STDMETHODCALLTYPE SetVertexShaderConstantI(UINT a0, CONST int* a1, UINT a2) override
+    { return real_->SetVertexShaderConstantI(a0, a1, a2); }
+    HRESULT STDMETHODCALLTYPE GetVertexShaderConstantI(UINT a0, int* a1, UINT a2) override
+    { return real_->GetVertexShaderConstantI(a0, a1, a2); }
+    HRESULT STDMETHODCALLTYPE SetVertexShaderConstantB(UINT a0, CONST BOOL* a1, UINT a2) override
+    { return real_->SetVertexShaderConstantB(a0, a1, a2); }
+    HRESULT STDMETHODCALLTYPE GetVertexShaderConstantB(UINT a0, BOOL* a1, UINT a2) override
+    { return real_->GetVertexShaderConstantB(a0, a1, a2); }
+    HRESULT STDMETHODCALLTYPE SetStreamSource(UINT a0, IDirect3DVertexBuffer9* a1, UINT a2,
+                                              UINT a3) override
+    { return real_->SetStreamSource(a0, a1, a2, a3); }
+    HRESULT STDMETHODCALLTYPE GetStreamSource(UINT a0, IDirect3DVertexBuffer9** a1, UINT* a2,
+                                              UINT* a3) override
+    { return real_->GetStreamSource(a0, a1, a2, a3); }
+    HRESULT STDMETHODCALLTYPE SetStreamSourceFreq(UINT a0, UINT a1) override
+    { return real_->SetStreamSourceFreq(a0, a1); }
+    HRESULT STDMETHODCALLTYPE GetStreamSourceFreq(UINT a0, UINT* a1) override
+    { return real_->GetStreamSourceFreq(a0, a1); }
+    HRESULT STDMETHODCALLTYPE SetIndices(IDirect3DIndexBuffer9* a0) override
+    { return real_->SetIndices(a0); }
+    HRESULT STDMETHODCALLTYPE GetIndices(IDirect3DIndexBuffer9** a0) override
+    { return real_->GetIndices(a0); }
+    HRESULT STDMETHODCALLTYPE CreatePixelShader(CONST DWORD* a0, IDirect3DPixelShader9** a1) override
+    { return real_->CreatePixelShader(a0, a1); }
+    HRESULT STDMETHODCALLTYPE SetPixelShader(IDirect3DPixelShader9* a0) override
+    { return real_->SetPixelShader(a0); }
+    HRESULT STDMETHODCALLTYPE GetPixelShader(IDirect3DPixelShader9** a0) override
+    { return real_->GetPixelShader(a0); }
+    HRESULT STDMETHODCALLTYPE SetPixelShaderConstantF(UINT a0, CONST float* a1, UINT a2) override
+    { return real_->SetPixelShaderConstantF(a0, a1, a2); }
+    HRESULT STDMETHODCALLTYPE GetPixelShaderConstantF(UINT a0, float* a1, UINT a2) override
+    { return real_->GetPixelShaderConstantF(a0, a1, a2); }
+    HRESULT STDMETHODCALLTYPE SetPixelShaderConstantI(UINT a0, CONST int* a1, UINT a2) override
+    { return real_->SetPixelShaderConstantI(a0, a1, a2); }
+    HRESULT STDMETHODCALLTYPE GetPixelShaderConstantI(UINT a0, int* a1, UINT a2) override
+    { return real_->GetPixelShaderConstantI(a0, a1, a2); }
+    HRESULT STDMETHODCALLTYPE SetPixelShaderConstantB(UINT a0, CONST BOOL* a1, UINT a2) override
+    { return real_->SetPixelShaderConstantB(a0, a1, a2); }
+    HRESULT STDMETHODCALLTYPE GetPixelShaderConstantB(UINT a0, BOOL* a1, UINT a2) override
+    { return real_->GetPixelShaderConstantB(a0, a1, a2); }
+    HRESULT STDMETHODCALLTYPE DrawRectPatch(UINT a0, CONST float* a1,
+                                            CONST D3DRECTPATCH_INFO* a2) override
+    { return real_->DrawRectPatch(a0, a1, a2); }
+    HRESULT STDMETHODCALLTYPE DrawTriPatch(UINT a0, CONST float* a1,
+                                           CONST D3DTRIPATCH_INFO* a2) override
+    { return real_->DrawTriPatch(a0, a1, a2); }
+    HRESULT STDMETHODCALLTYPE DeletePatch(UINT a0) override
+    { return real_->DeletePatch(a0); }
+    HRESULT STDMETHODCALLTYPE CreateQuery(D3DQUERYTYPE a0, IDirect3DQuery9** a1) override
+    { return real_->CreateQuery(a0, a1); }
+
+private:
+    IDirect3DDevice9* real_;
+    IDirect3D9*       parentProxy_;   /* our IDirect3D9 wrapper */
+    IDirect3D9*       parentReal_;    /* the object it wraps */
+    HWND              focus_;         /* focus window from CreateDevice, for Reset */
+};
+
+/* ------------------------------------------------------------------ the proxy */
+
+/* Deriving from IDirect3D9 makes the compiler generate the vtable from the SDK
+ * declaration. Every method below must match the header or the class stays abstract
+ * and the build fails - which is the whole point. */
+class D3D9Proxy final : public IDirect3D9
+{
+public:
+    explicit D3D9Proxy(IDirect3D9* real) : real_(real) {}
+
+    /* --- IUnknown --- */
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override
+    {
+        HRESULT hr = real_->QueryInterface(riid, ppv);
+        /* Hand back the wrapper rather than the object it wraps. */
+        if (SUCCEEDED(hr) && ppv && *ppv == (void*)real_)
+            *ppv = static_cast<IDirect3D9*>(this);
+        return hr;
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() override { return real_->AddRef(); }
+
+    ULONG STDMETHODCALLTYPE Release() override
+    {
+        ULONG n = real_->Release();
+        if (n == 0) {
+            this->~D3D9Proxy();
+            HeapFree(GetProcessHeap(), 0, this);
+        }
+        return n;
+    }
+
+    /* --- IDirect3D9 pass-through --- */
+
+    HRESULT STDMETHODCALLTYPE RegisterSoftwareDevice(void* pInit) override
+    { return real_->RegisterSoftwareDevice(pInit); }
+
+    UINT STDMETHODCALLTYPE GetAdapterCount() override
+    { return real_->GetAdapterCount(); }
+
+    HRESULT STDMETHODCALLTYPE GetAdapterIdentifier(UINT a, DWORD f,
+                                                   D3DADAPTER_IDENTIFIER9* id) override
+    { return real_->GetAdapterIdentifier(a, f, id); }
+
+    UINT STDMETHODCALLTYPE GetAdapterModeCount(UINT a, D3DFORMAT fmt) override
+    { return real_->GetAdapterModeCount(a, fmt); }
+
+    HRESULT STDMETHODCALLTYPE EnumAdapterModes(UINT a, D3DFORMAT fmt, UINT mode,
+                                               D3DDISPLAYMODE* out) override
+    { return real_->EnumAdapterModes(a, fmt, mode, out); }
+
+    HRESULT STDMETHODCALLTYPE GetAdapterDisplayMode(UINT a, D3DDISPLAYMODE* out) override
+    { return real_->GetAdapterDisplayMode(a, out); }
+
+    HRESULT STDMETHODCALLTYPE CheckDeviceType(UINT a, D3DDEVTYPE devType,
+                                              D3DFORMAT adapterFmt, D3DFORMAT bbFmt,
+                                              BOOL windowed) override
+    {
+        /* The game asks whether its fullscreen combination is supported. Answer for the
+         * windowed case we are actually going to create, or it may bail before CreateDevice. */
+        UNREFERENCED_PARAMETER(windowed);
+        return real_->CheckDeviceType(a, devType, adapterFmt, bbFmt, TRUE);
+    }
+
+    HRESULT STDMETHODCALLTYPE CheckDeviceFormat(UINT a, D3DDEVTYPE devType,
+                                                D3DFORMAT adapterFmt, DWORD usage,
+                                                D3DRESOURCETYPE rtype,
+                                                D3DFORMAT checkFmt) override
+    { return real_->CheckDeviceFormat(a, devType, adapterFmt, usage, rtype, checkFmt); }
+
+    HRESULT STDMETHODCALLTYPE CheckDeviceMultiSampleType(UINT a, D3DDEVTYPE devType,
+                                                         D3DFORMAT surfFmt, BOOL windowed,
+                                                         D3DMULTISAMPLE_TYPE mst,
+                                                         DWORD* quality) override
+    { return real_->CheckDeviceMultiSampleType(a, devType, surfFmt, windowed, mst, quality); }
+
+    HRESULT STDMETHODCALLTYPE CheckDepthStencilMatch(UINT a, D3DDEVTYPE devType,
+                                                     D3DFORMAT adapterFmt,
+                                                     D3DFORMAT rtFmt,
+                                                     D3DFORMAT dsFmt) override
+    { return real_->CheckDepthStencilMatch(a, devType, adapterFmt, rtFmt, dsFmt); }
+
+    HRESULT STDMETHODCALLTYPE CheckDeviceFormatConversion(UINT a, D3DDEVTYPE devType,
+                                                          D3DFORMAT srcFmt,
+                                                          D3DFORMAT tgtFmt) override
+    { return real_->CheckDeviceFormatConversion(a, devType, srcFmt, tgtFmt); }
+
+    HRESULT STDMETHODCALLTYPE GetDeviceCaps(UINT a, D3DDEVTYPE devType,
+                                            D3DCAPS9* caps) override
+    { return real_->GetDeviceCaps(a, devType, caps); }
+
+    HMONITOR STDMETHODCALLTYPE GetAdapterMonitor(UINT a) override
+    { return real_->GetAdapterMonitor(a); }
+
+    /* The first of the two places Windowed is set. The other is Reset, which is why the
+     * device that comes back here has to be wrapped rather than handed straight over. */
+    HRESULT STDMETHODCALLTYPE CreateDevice(UINT adapter, D3DDEVTYPE devType, HWND hFocus,
+                                           DWORD behaviour, D3DPRESENT_PARAMETERS* pp,
+                                           IDirect3DDevice9** ppDevice) override
+    {
+        HWND target = ForceWindowed(pp, hFocus, "create");
+
+        HRESULT hr = real_->CreateDevice(adapter, devType, hFocus, behaviour, pp, ppDevice);
+        Log("[create] result=0x%08X", hr);
+        if (FAILED(hr)) return hr;
+
+        /* Some drivers resize the window during device creation; reassert afterwards. */
+        if (pp) ApplyWindowMode(target, pp->BackBufferWidth, pp->BackBufferHeight);
+
+        if (ppDevice && *ppDevice) {
+            void* mem = HeapAlloc(GetProcessHeap(), 0, sizeof(D3D9DeviceProxy));
+            if (mem) {
+                D3D9DeviceProxy* d = new (mem) D3D9DeviceProxy(*ppDevice, this, real_, target);
+                Log("[create] wrapped IDirect3DDevice9 0x%08X as 0x%08X", PTRV(*ppDevice), PTRV(d));
+                *ppDevice = d;
+            }
+            else {
+                /* Hand back the real device rather than failing the call: the game still
+                 * runs, it just loses windowed enforcement across a Reset. */
+                Log("[create] WARNING out of memory, device left unwrapped");
+            }
+        }
+        return hr;
+    }
+
+private:
+    IDirect3D9* real_;
 };
 
 /* ------------------------------------------------------------------ exports */
 
 extern "C" {
 
-typedef ID3D9* (WINAPI *PFN_Create9)(UINT);
+typedef IDirect3D9* (WINAPI *PFN_Create9)(UINT);
 
-ID3D9* WINAPI Direct3DCreate9(UINT sdkVersion)
+IDirect3D9* WINAPI Direct3DCreate9(UINT sdkVersion)
 {
     LoadConfig();
 
@@ -404,23 +771,22 @@ ID3D9* WINAPI Direct3DCreate9(UINT sdkVersion)
         return NULL;
     }
 
-    ID3D9* real = fn(sdkVersion);
+    IDirect3D9* real = fn(sdkVersion);
     if (!real) return NULL;
 
-    Wrapper* w = (Wrapper*)HeapAlloc(GetProcessHeap(), 0, sizeof(Wrapper));
-    if (!w) return real;   /* degrade to pass-through rather than fail the game */
+    void* mem = HeapAlloc(GetProcessHeap(), 0, sizeof(D3D9Proxy));
+    if (!mem) return real;   /* degrade to pass-through rather than fail the game */
 
-    w->lpVtbl = &g_vtbl;
-    w->real   = real;
+    D3D9Proxy* w = new (mem) D3D9Proxy(real);
     Log("[init] wrapped IDirect3D9 0x%08X as 0x%08X (mode=%d)", PTRV(real), PTRV(w), g_mode);
-    return (ID3D9*)w;
+    return w;
 }
 
 /* IDirect3D9Ex has an extended vtable this proxy does not model, so it is passed
  * through untouched. BGE uses Direct3DCreate9; nothing here depends on the Ex path. */
-HRESULT WINAPI Direct3DCreate9Ex(UINT sdkVersion, void** out)
+HRESULT WINAPI Direct3DCreate9Ex(UINT sdkVersion, IDirect3D9Ex** out)
 {
-    typedef HRESULT (WINAPI *PFN)(UINT, void**);
+    typedef HRESULT (WINAPI *PFN)(UINT, IDirect3D9Ex**);
     PFN fn = (PFN)ChainProc("Direct3DCreate9Ex");
     if (!fn) return E_NOTIMPL;
     return fn(sdkVersion, out);
