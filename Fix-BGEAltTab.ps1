@@ -188,12 +188,23 @@ function Test-Admin {
 }
 
 function Invoke-SelfElevate {
-    # Rebuild the original invocation so the elevated copy does the same thing.
+    <#
+        Rebuild the original invocation so the elevated copy does the same thing.
+
+        $Bound must be passed in from the script scope. $PSBoundParameters is per-scope:
+        read inside a function it is that function's own bound parameters, which for this
+        one is always empty - so reading it here silently forwarded nothing and the
+        elevated child ran with every option at its default.
+    #>
+    param([System.Collections.IDictionary]$Bound)
+
     # -NoExit keeps the elevated console open; without it the window closes the moment
     # the script finishes and the summary is never readable.
     $argList = @('-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
 
-    foreach ($kv in $PSBoundParameters.GetEnumerator()) {
+    if (-not $Bound) { $Bound = @{} }
+
+    foreach ($kv in $Bound.GetEnumerator()) {
         if ($kv.Key -eq 'NoElevate') { continue }
         if ($kv.Value -is [switch]) {
             if ($kv.Value.IsPresent) { $argList += "-$($kv.Key)" }
@@ -473,6 +484,26 @@ function Test-IsOurProxy {
     catch { return $false }
 }
 
+function Test-WasInstalledByUs {
+    <#
+        Covers proxies installed before the BGEFIX_PROXY_V1 marker existed. Those DLLs
+        carry no marker, so without this an upgrade would classify our own previous
+        build as third-party and chain the new proxy to it.
+    #>
+    param([string]$Path)
+
+    $s = Get-State
+    if (-not $s) { return $false }
+    $names = $s.PSObject.Properties.Name
+    foreach ($k in @('ProxyTarget', 'PadTarget')) {
+        if ($names -contains $k) {
+            $v = [string]$s.$k
+            if ($v -and ($v -eq $Path)) { return $true }
+        }
+    }
+    return $false
+}
+
 function Install-ProxyDll {
     <#
         Shared installer for the in-repo proxy DLLs (d3d9.dll and dinput8.dll).
@@ -507,7 +538,7 @@ function Install-ProxyDll {
         # Identify our own DLL by its embedded marker, not by hashing against the source.
         # A rebuilt proxy has different bytes, and a hash check would classify the
         # already-installed copy as third-party and chain the new build to the old one.
-        if (-not (Test-IsOurProxy -Path $target)) {
+        if (-not (Test-IsOurProxy -Path $target) -and -not (Test-WasInstalledByUs -Path $target)) {
             if (Test-Path -LiteralPath $chainTarget) {
                 throw ("Both $TargetName and $ChainName already exist in the game folder. " +
                        "Resolve that by hand so nothing is lost, then re-run.")
@@ -937,7 +968,8 @@ try {
             throw 'Administrator rights are required (sdbinst modifies machine-scope settings). Re-run from an elevated prompt.'
         }
         else {
-            Invoke-SelfElevate
+            # $PSBoundParameters must be read here, in script scope, not inside the function.
+            Invoke-SelfElevate -Bound $PSBoundParameters
             return
         }
     }
