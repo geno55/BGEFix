@@ -1,0 +1,16 @@
+# MSVC build intermediates
+*.obj
+*.exp
+*.lib
+*.pdb
+*.ilk
+
+# test binary and proxy runtime output
+dist/test_proxy.exe
+dist/d3d9_windowed.log
+dist/d3d9_windowed.ini
+
+*.bak
+
+# Note: dist/d3d9.dll IS committed on purpose. The installer defaults to it so
+# users do not need a C++ toolchain. Rebuild with src\build.cmd.
