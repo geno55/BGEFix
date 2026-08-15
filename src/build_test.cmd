@@ -42,5 +42,10 @@ rem Pass a number of seconds to watch live controller input, e.g. build_test.cmd
 "%OUTDIR%\test_dinput.exe" %1
 if not "%ERRORLEVEL%"=="0" set RC=%ERRORLEVEL%
 
+rem The installer's DLL classification decides whether a file in the game folder is
+rem replaced or backed up and chained, so it is tested too. No compiler needed.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0test_installer.ps1"
+if not "%ERRORLEVEL%"=="0" set RC=%ERRORLEVEL%
+
 popd
 exit /b %RC%

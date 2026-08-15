@@ -85,9 +85,11 @@
 
 #define PTRV(p) ((unsigned)(UINT_PTR)(p))
 
-/* Lets the installer recognise this DLL as one of ours across rebuilds. See the note in
- * d3d9_windowed.cpp. Referenced from DllMain so it is not optimised out. */
-static const char kProxyMarker[] = "BGEFIX_PROXY_V1";
+/* Lets the installer recognise this DLL as one of ours across rebuilds. The GUID is the
+ * identity, the trailing number is a version the installer parses rather than compares.
+ * See the fuller note in d3d9_windowed.cpp. Referenced from DllMain so it is not
+ * optimised out. */
+static const char kProxyMarker[] = "BGEFIX_PROXY{502eb6b9-f979-4627-b242-8e146e0fc1de}v2";
 
 /* A mapping target: 0 = unmapped, MOUSE_BASE+n = mouse button n, else a DIK scan code. */
 #define MOUSE_BASE 0x1000

@@ -68,9 +68,15 @@
 
 /* Lets the installer recognise this DLL as one of ours across rebuilds. Identifying it
  * by file hash instead would make an upgraded build look third-party, and the installer
- * would chain the new proxy to the old one. Referenced from DllMain so it is not
- * optimised out of the binary. */
-static const char kProxyMarker[] = "BGEFIX_PROXY_V1";
+ * would chain the new proxy to the old one.
+ *
+ * The GUID is the identity and never changes. The trailing number is a version, and the
+ * installer matches the prefix and PARSES it rather than comparing the whole string - if
+ * it compared, then bumping this number would make the next installer treat this build as
+ * a third-party wrapper and chain to it, which is the very thing the marker prevents.
+ *
+ * Referenced from DllMain so it is not optimised out of the binary. */
+static const char kProxyMarker[] = "BGEFIX_PROXY{502eb6b9-f979-4627-b242-8e146e0fc1de}v2";
 
 /* ------------------------------------------------------------------ state */
 

@@ -1,7 +1,12 @@
-# BGE Alt+Tab Fix
+# BGEFix
 
-Restores **Alt+Tab** in the GOG.com release of *Beyond Good & Evil* (2003), without
-throwing away the compatibility fix you actually want, and with no third-party downloads.
+Fixes for the GOG.com release of *Beyond Good & Evil* (2003), with no third-party
+downloads. Three independent parts, installable separately:
+
+- **Alt+Tab** — restored, without throwing away the compatibility shim you actually want.
+- **Windowed mode** — ends the exclusive-fullscreen device that caused the problem GOG
+  papered over.
+- **Controller support** — XInput gamepads, which the GOG build has no code for at all.
 
 ---
 
@@ -23,12 +28,17 @@ C:\Windows\AppPatch\CustomSDB\{a0619476-ee14-4631-b5e4-36bcb2c6e987}.sdb
   registered  : HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Custom\BGE.exe
 ```
 
-It applies exactly two shims to `BGE.exe`:
+In the build tested here it applies exactly two shims to `BGE.exe`:
 
 | Shim | Effect | Verdict |
 |---|---|---|
 | `IgnoreAltTab` | Makes the game swallow Alt+Tab entirely | **This is the bug** |
 | `SingleProcAffinity` | Pins the game to one CPU core; keeps the Jade engine's timing stable on modern many-core processors | **Keep this** |
+
+That table is what *this* database contained when it was examined, not an assumption the
+tool makes. `-Status` enumerates the database on your machine by parsing it, so if GOG
+reissues it with a third shim you will be told — see
+[Reading the shim database](#reading-the-shim-database).
 
 The underlying reason GOG did it: the game holds an *exclusive fullscreen* Direct3D 9
 device. Alt-tabbing away loses that device, and the game handles the loss badly — corrupt
@@ -38,17 +48,21 @@ removed the feature that exposed it.
 ## The approach
 
 A custom shim database is all-or-nothing — you cannot disable one shim inside it without
-rebuilding the database. So this tool:
+rebuilding the database. So this tool rebuilds it:
 
-1. **Removes the shim database** using Microsoft's own supported tool, `sdbinst`.
+1. **Removes GOG's shim database** using Microsoft's own supported tool, `sdbinst`.
    Not by renaming `BGE.exe` to defeat the filename match (see below).
-2. **Restores single-core behaviour externally**, via a launcher shortcut that uses
-   `start /affinity`. Child processes inherit processor affinity, so pinning the
-   documented launch chain entry point covers the whole game:
-   `CheckApplication.exe` → `run.exe` → `BGE.exe`.
+2. **Installs a replacement database that applies only `SingleProcAffinity`**, derived
+   from GOG's own by deleting the `IgnoreAltTab` entry. Affinity stays a property of
+   `BGE.exe` enforced by Windows, so it applies however the game is started — GOG Galaxy,
+   a Steam shortcut, or the executable directly.
 3. **Takes the game out of exclusive fullscreen** by installing the bundled d3d9 proxy,
    so there is no device to lose in the first place. This addresses the *original* bug,
    not just the symptom — without it, Alt+Tab works but the HUD can still corrupt.
+
+A desktop launcher using `start /affinity` is still created as a convenience, but it is no
+longer how affinity is applied. If the replacement database cannot be built or does not
+register, the tool falls back to that launcher and says so.
 
 Every change is backed up and reversible.
 
@@ -80,25 +94,25 @@ builds are detected but reported as unrecognised.
 Check what state your install is in. Read-only, requires no elevation:
 
 ```bash
-powershell -ExecutionPolicy Bypass -File .\Fix-BGEAltTab.ps1 -Status
+powershell -ExecutionPolicy Bypass -File .\Fix-BGE.ps1 -Status
 ```
 
 Preview every change without touching anything. Also needs no elevation:
 
 ```bash
-powershell -ExecutionPolicy Bypass -File .\Fix-BGEAltTab.ps1 -WhatIf
+powershell -ExecutionPolicy Bypass -File .\Fix-BGE.ps1 -WhatIf
 ```
 
 Apply the fix. Prompts for confirmation and elevates automatically:
 
 ```bash
-powershell -ExecutionPolicy Bypass -File .\Fix-BGEAltTab.ps1
+powershell -ExecutionPolicy Bypass -File .\Fix-BGE.ps1
 ```
 
 Undo everything:
 
 ```bash
-powershell -ExecutionPolicy Bypass -File .\Fix-BGEAltTab.ps1 -Revert
+powershell -ExecutionPolicy Bypass -File .\Fix-BGE.ps1 -Revert
 ```
 
 ### Parameters
@@ -111,19 +125,87 @@ powershell -ExecutionPolicy Bypass -File .\Fix-BGEAltTab.ps1 -Revert
 | `-AffinityMask <int>` | `1` | CPU bitmask for the launcher. `1` = first core (matches the shim). `3` = first two cores. |
 | `-WindowMode <0-2>` | `1` | 0 = windowed, 1 = borderless centred, 2 = borderless stretched. |
 | `-ProxyPath <path>` | `dist\d3d9.dll` | Prebuilt proxy to install. Verified 32-bit before use. |
-| `-InstallControllerSupport` | — | Add XInput (Xbox) controller support. |
+| `-Component <list>` | `AltTab,Windowed,Shortcut` | Which parts to act on — see below. `All` selects everything. Also applies to `-Revert`, where it defaults to `All`. |
 | `-PadLookSpeed <100-20000>` | `1800` | Right-stick look speed, in mouse counts per second at full deflection. Frame-rate independent. |
 | `-PadDeadzone <0-32000>` | `7849` | Left-stick deadzone, raw XInput units. Default is XInput's recommended value. |
 | `-PadLookDeadzone <0-32000>` | `8689` | Right-stick deadzone, raw XInput units. Default is XInput's recommended value. |
 | `-PadInvertLook` | — | Invert the right stick's vertical axis. |
 | `-PadPath <path>` | `dist\dinput8.dll` | Prebuilt controller proxy to install. |
 | `-ResetConfig` | — | Regenerate the `.ini` files. Without it, existing configs are preserved. |
-| `-NoShortcut` | — | Skip the launcher. **Leaves you with no affinity pinning at all.** |
-| `-NoWindowedProxy` | — | Skip the proxy. **Leaves the game in exclusive fullscreen.** |
-| `-NoElevate` | — | Error out instead of prompting for elevation. |
+| `-NoElevate` | — | Error out instead of prompting for elevation. Never forwarded to the elevated copy. |
 | `-Force` | — | Skip confirmation prompts. |
 
 `-WhatIf` and `-Confirm` are supported throughout.
+
+### Components
+
+This tool does three separable things, and the controller proxy in particular has nothing
+to do with Alt+Tab. Each is selected by name, with one polarity:
+
+| Component | What it does | Needs the others? |
+|---|---|---|
+| `AltTab` | Replaces GOG's shim database with one applying only `SingleProcAffinity` | no |
+| `Windowed` | Installs the d3d9 proxy, ending exclusive fullscreen | no |
+| `Controller` | Installs the dinput8 XInput proxy | **no** |
+| `Shortcut` | Creates the desktop launcher (convenience only) | no |
+
+```bash
+powershell -ExecutionPolicy Bypass -File .\Fix-BGE.ps1 -Component Controller
+```
+
+That installs gamepad support and touches nothing else — no compatibility database is
+removed, no shortcut appears. Previously the only way to get controller support was
+`-InstallControllerSupport`, which ran the entire apply path.
+
+`-Revert` takes the same list, so `-Revert -Component Controller` removes the gamepad
+proxy and leaves everything else installed.
+
+Selection used to be `-NoShortcut`, `-NoWindowedProxy` and `-InstallControllerSupport` —
+two opt-outs and an opt-in for three co-equal features. **They have been removed**, not
+deprecated: passing one is now a parameter binding error. That is loud and changes
+nothing, where a silent remap of a misread flag would not be.
+
+| Was | Now |
+|---|---|
+| *(default)* | *(unchanged)* |
+| `-NoShortcut` | `-Component AltTab,Windowed` |
+| `-NoWindowedProxy` | `-Component AltTab,Shortcut` |
+| `-InstallControllerSupport` | `-Component All` |
+| — | `-Component Controller` (new: gamepad only) |
+
+**Contradictions are now binding errors**, not silently-resolved precedence. `-Status`,
+`-Revert` and the install path are separate parameter sets, and apply-only tuning is not
+declared in the others:
+
+```
+-Status -Revert            -> Parameter set cannot be resolved
+-Revert -WindowMode 2      -> Parameter set cannot be resolved
+-Component Controller -WindowMode 2
+                           -> -WindowMode only applies to the Windowed component
+```
+
+The last one is a runtime check: parameter sets cannot express "only meaningful when
+`-Component` includes `Windowed`", and silently ignoring the setting is how people come to
+believe they configured something they did not.
+
+### Running it unattended
+
+`-Force` skips the confirmation prompt, and the script is safe to drive from another
+script:
+
+- **The exit code is real.** When the script elevates itself it waits for the elevated
+  copy and returns *its* exit code. 0 means the work succeeded; non-zero means it failed
+  or you cancelled the UAC prompt. Earlier versions launched the elevated copy and
+  returned immediately, so the caller always saw success.
+- **`-Force` actually runs unattended.** The elevated window closes on its own. Without
+  `-Force` it pauses on a keypress instead, so you can read the summary.
+- **The shortcut lands on your desktop, not the administrator's.** On a standard account
+  UAC elevates into a different account; the desktop is resolved before elevating and
+  passed down, so `-Status` run unelevated afterwards agrees with what was installed.
+
+```bash
+powershell -ExecutionPolicy Bypass -File .\Fix-BGE.ps1 -Force
+```
 
 ---
 
@@ -242,7 +324,7 @@ on a 16:9 display, since D3D stretches the backbuffer to the client area.
 ## Controller support (XInput)
 
 ```bash
-powershell -ExecutionPolicy Bypass -File .\Fix-BGEAltTab.ps1 -InstallControllerSupport
+powershell -ExecutionPolicy Bypass -File .\Fix-BGE.ps1 -InstallControllerSupport
 ```
 
 The GOG release famously has no controller support, and that is not a setting anyone
@@ -374,24 +456,34 @@ regenerate the file, or add a `LookSpeed` line yourself.
 
 | Change | Location |
 |---|---|
-| Shim database uninstalled | `HKLM\...\AppCompatFlags\Custom\BGE.exe` + `%WINDIR%\AppPatch\CustomSDB\` |
-| Launcher shortcut created | `%USERPROFILE%\Desktop\Beyond Good & Evil (Alt+Tab Fix).lnk` |
-| Proxy + config installed | `<game>\d3d9.dll`, `<game>\d3d9_windowed.ini` |
-| Controller proxy + config | `<game>\dinput8.dll`, `<game>\dinput8_xinput.ini` — only with `-InstallControllerSupport` |
+| Shim database replaced | `HKLM\...\AppCompatFlags\Custom\BGE.exe` + `%WINDIR%\AppPatch\CustomSDB\` |
+| Launcher shortcut created | `%USERPROFILE%\Desktop\Beyond Good & Evil (BGEFix).lnk` — only with the `Shortcut` component |
+| Proxy + config installed | `<game>\d3d9.dll`, `<game>\d3d9_windowed.ini` — only with the `Windowed` component |
+| Controller proxy + config | `<game>\dinput8.dll`, `<game>\dinput8_xinput.ini` — only with the `Controller` component |
 | Pre-existing DLLs renamed | `<game>\d3d9_chain.dll`, `<game>\dinput8_chain.dll` (restored on `-Revert`) |
-| Backups + revert data | `%ProgramData%\BGEAltTabFix\` |
+| Backups + revert data | `%ProgramData%\BGEFix\` |
 
 The original `goggame.sdb` also remains untouched in the game folder, so the change is
 reversible even if the backup directory is deleted.
 
+### Upgrading from an older version
+
+The state directory and the shortcut were renamed, and **nothing is migrated**. If you
+applied the fix with an older build, revert with *that* build first. Otherwise the old
+`%ProgramData%\BGEAltTabFix\` and `Beyond Good & Evil (Alt+Tab Fix).lnk` are stranded:
+this version does not know about them, `-Revert` will not touch them, and deleting them is
+a manual job.
+
 ## Important limitations
 
-**Launch the game from the new shortcut.** Removing the shim database is machine-wide, so
-Alt+Tab is fixed no matter how you start the game — but processor affinity is only applied
-by the shortcut. Starting the game from GOG Galaxy, the Start Menu, or the original desktop
-icon gives you Alt+Tab *without* single-core pinning. If you see timing or audio problems,
-that is why. (To fix this at the source, point GOG Galaxy's launch task at the new shortcut,
-or use the ADK route below.)
+**Start the game however you like.** Both halves are machine-wide: Alt+Tab is fixed because
+GOG's database is gone, and single-core pinning still applies because the replacement
+database applies `SingleProcAffinity` to `BGE.exe` itself. GOG Galaxy, the Start Menu, the
+original desktop icon and the new launcher all behave the same.
+
+The exception is if the replacement database could not be installed — the tool warns
+loudly when that happens and falls back to the launcher shortcut, and only then does it
+matter which icon you use. `-Status` always shows which of the two is in force.
 
 **Reinstalling the game restores the shim.** GOG's installer gates the shim install behind
 a `DoSDBOnce1207658746=1` flag in `goglog.ini`. A fresh install or a repair can re-register
@@ -404,8 +496,8 @@ Re-running is safe and is the supported way to repair or upgrade an install. Spe
 - Removing the shim is skipped when it is already gone.
 - The launcher shortcut is rewritten in place.
 - A proxy already installed is replaced by the current build. Our DLLs carry an embedded
-  marker (`BGEFIX_PROXY_V1`), so an upgraded build recognises an older build of itself
-  rather than mistaking it for a third-party wrapper and chaining to it.
+  marker, so an upgraded build recognises an older build of itself rather than mistaking
+  it for a third-party wrapper and chaining to it. See below.
 - A third-party DLL that was chained on a previous run stays chained, and is re-recorded
   each run so `-Revert` can always put it back.
 - **Your `.ini` files are never overwritten.** Once a config exists it is left alone, so
@@ -415,18 +507,103 @@ The one state that is deliberately *not* auto-resolved: if both `d3d9.dll` and
 `d3d9_chain.dll` (or the `dinput8` pair) exist and the first is not ours, the installer
 refuses rather than guess which to keep.
 
-**Only databases containing `IgnoreAltTab` are removed.** If a database is registered for
-`BGE.exe` that the script cannot identify, it refuses to touch it rather than guessing.
+### Recognising our own DLLs
+
+The marker is `BGEFIX_PROXY{502eb6b9-…}v2`. The GUID is the identity and never changes;
+the trailing number is a version, and the installer **matches the prefix and parses the
+number** rather than comparing the whole string.
+
+That distinction is the entire point. An installer that looked for the exact marker it
+ships would meet the *previous* release's DLL, fail to recognise it, classify it as a
+third-party wrapper, rename it to `d3d9_chain.dll` and chain new-to-old — which is
+precisely the failure the marker was introduced to prevent, arriving one release later on
+schedule. Older markers are listed and still recognised; newer ones parse fine and are
+replaced with a warning rather than chained to.
+
+This answer is also the authority for overwriting a file in the game folder **without
+backing it up**, so it is more than a substring search. The file must be a 32-bit PE, and
+the version digits must be followed by a NUL, since the marker is a C string literal. That
+rejects logs, configs, saves, 64-bit DLLs and chance occurrences inside unrelated blobs.
+It remains evidence rather than proof — a string in a binary always is — but it fails
+closed: anything unrecognised is treated as third-party, which means backed up and
+chained, never silently replaced.
+
+[`src/test_installer.ps1`](src/test_installer.ps1) covers this, and runs as part of
+`src\build_test.cmd`. It synthesises markers this build does not carry — one older, one
+newer — because the interesting failure only exists across releases and cannot be
+reproduced with the shipping marker alone:
+
+```
+PASS a PREVIOUS release is still recognised as ours -> v1
+PASS a FUTURE release is still recognised as ours   -> v99
+PASS a text file containing the marker is rejected  -> not a 32-bit PE
+PASS a PE whose marker is not NUL-terminated is rejected -> fails the C-string check
+```
+
+### Reading the shim database
+
+Removing a machine-scope compatibility database is only defensible if you know what is in
+it, so the tool reads it — it walks the `.sdb` tag tree through `apphelp.dll`, the same
+parser Windows itself uses, and reports every executable the database patches and every
+modification it applies to each.
+
+It did not always. The previous implementation searched the raw bytes for the two shim
+names the script already hardcodes, which made it structurally incapable of returning a
+third: if GOG reissued the database with an extra shim, the tool would report the same two,
+remove the database, and drop the third silently — while `-Status` printed the list as
+though it were an inventory of the file.
+
+Consequences of reading it for real:
+
+- `-Status` lists what the database actually contains, and marks anything this tool does
+  not account for as `<- NOT accounted for by this tool`.
+- Applying the fix warns before the confirmation prompt if the database applies anything
+  beyond the two known shims, naming what removal would drop.
+- **A database that cannot be parsed is treated as unknown, not as empty**, and the tool
+  refuses to remove it. "No shims found" and "could not read the file" are different
+  answers and are no longer conflated.
+- **Only databases that actually apply `IgnoreAltTab` are removed.** If a database is
+  registered for `BGE.exe` that the script cannot identify, it refuses to touch it rather
+  than guessing, and now says what it found instead.
+
+[`src/test_installer.ps1`](src/test_installer.ps1) builds real `.sdb` files carrying shims
+the tool has never heard of, which is the case the old implementation could not even
+represent:
+
+```
+PASS an UNHARDCODED third shim is discovered -> shims: IgnoreAltTab, SingleProcAffinity, SomeFutureShim
+PASS an unrelated database reports its real contents -> shims: WinXPSP3, Win8RTMVersionLie
+PASS an unparseable database reports UNKNOWN, not empty -> Ok=False
+PASS the real GOG database parses -> GOG.com Beyond Good and Evil: SingleProcAffinity, IgnoreAltTab
+```
+
+### Why derive it instead of shipping one
+
+This repository commits prebuilt `dist\d3d9.dll` and `dist\dinput8.dll`, so shipping a
+prebuilt `.sdb` would be consistent — and simpler. It is deliberately not done, for one
+reason: the parts of that database that make the shim actually apply are GOG's, not ours.
+The matching rules, the app name and vendor, the per-executable GUID and the name index
+keyed on them are all their authored data. The DLLs are built from source in this repo and
+are ours to ship; a GOG-authored compatibility database is not.
+
+Deriving from the copy already on the user's disk avoids redistributing it, keeps every one
+of those fields byte-identical so the shim still matches, and keeps working if GOG reissues
+the database. It also means the tool preserves any *other* shim the database applies —
+only `IgnoreAltTab` is removed, rather than a hardcoded set being reimposed.
 
 ## The purist alternative
 
-The fully surgical fix for step 2 is to rebuild the shim database containing *only*
-`SingleProcAffinity`, using **Compatibility Administrator** from the
-[Windows ADK](https://learn.microsoft.com/en-us/windows-hardware/get-started/adk-install).
-That keeps affinity applied by Windows itself regardless of how the game is launched, with
-no launcher shortcut needed. It reaches the same end state as this script, minus the
-launcher caveat, at the cost of an ADK download. This script exists because most people
-will not install the ADK to play a 2003 adventure game.
+Earlier versions of this tool replaced `SingleProcAffinity` with a desktop shortcut and
+described rebuilding the database as a "purist alternative" needing the
+[Windows ADK](https://learn.microsoft.com/en-us/windows-hardware/get-started/adk-install)'s
+Compatibility Administrator. That was a downgrade dressed up as a replacement: a shim the
+OS applied unconditionally became something the user had to remember to click, and
+`-NoShortcut` silently meant "no affinity at all".
+
+It is also not true that the ADK is required. Compatibility Administrator *authors* an
+`.sdb`; it is not needed to *edit* one. The tool now rebuilds the database itself — see
+above — so the surgical fix is the default and there is no purist alternative left to
+describe.
 
 ## Credits
 
