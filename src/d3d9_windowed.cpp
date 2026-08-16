@@ -13,6 +13,10 @@
  * not touch aspect ratio, resolution, FOV or shaders. Anything that does belongs in
  * a separate DLL chained behind this one (see below).
  *
+ * It does one other thing, for the two GOG-supplied executables rather than for the game:
+ * it stands in a 16-bit display-mode list when the driver reports none. See
+ * "The launcher's mode list" further down.
+ *
  * Both places the field is set
  * ----------------------------
  * A D3D9 application sets Windowed in two places, and intercepting only the first is a
@@ -78,7 +82,8 @@ static const ProxyConfig kProxyConfig = {
     L"d3d9.dll"           /* the real implementation, under System32 */
 };
 
-static int g_mode = MODE_BORDERLESS;
+static int  g_mode = MODE_BORDERLESS;
+static BOOL g_fill16 = TRUE;
 
 /* ------------------------------------------------------------------ config */
 
@@ -87,6 +92,7 @@ static void LoadConfig(void)
     if (!g_iniPath[0]) return;
     g_mode = (int)GetPrivateProfileIntW(L"Display", L"Mode", MODE_BORDERLESS, g_iniPath);
     if (g_mode < MODE_WINDOWED || g_mode > MODE_STRETCH) g_mode = MODE_BORDERLESS;
+    g_fill16 = GetPrivateProfileIntW(L"Display", L"Fill16BitModeList", 1, g_iniPath) != 0;
     ProxyLoadCommonConfig();   /* [General] Log */
 }
 
@@ -613,12 +619,69 @@ public:
                                                    D3DADAPTER_IDENTIFIER9* id) override
     { return real_->GetAdapterIdentifier(a, f, id); }
 
+    /* --- the launcher's mode list ---
+     *
+     * These two are not about the game. BGE.exe never enumerates modes: it reads the
+     * resolution the settings app saved and goes straight to CreateDevice. The two
+     * GOG-supplied executables in the same folder do enumerate, and they load this DLL
+     * because it sits beside them:
+     *
+     *   SettingsApplication.exe  fills its Resolution and Refresh rate dropdowns
+     *   CheckApplication.exe     validates the saved config, then launches either
+     *                            run.exe -> BGE.exe (into the game) or the settings app
+     *
+     * Both build that list from ONE format - D3DFMT_R5G6B5, 16-bit - and neither has a
+     * fallback. On hardware where the D3D9 runtime reports no R5G6B5 modes, the list is
+     * empty, and both symptoms follow from that single fact: the dropdowns come up blank,
+     * and the launcher decides the saved mode index is invalid and re-runs the settings
+     * app on every launch instead of starting the game.
+     *
+     * That report is not stable. On the machine this was diagnosed on (hybrid Radeon 780M
+     * + RTX 4060) the same probe binary run twice seconds apart got 119 modes and then 0,
+     * so the same install works one launch and not the next. Nothing this project installs
+     * causes it - it reproduces with every file here removed - but this DLL is already
+     * loaded by both executables, which makes it the one place that can paper over it.
+     *
+     * So: when the driver reports no R5G6B5 modes at all, stand in the X8R8G8B8 list,
+     * relabelled. Same resolutions, same refresh rates, same order, so the mode INDEX the
+     * settings app saves still means what it meant when the driver was reporting the real
+     * 16-bit list.
+     *
+     * Only R5G6B5, and only when the real count is zero. D3DFMT_X1R5G5B5 is deliberately
+     * left alone: a build that filled that one in as well crashed SettingsApplication.exe
+     * outright (0xC0000005), because the driver reports zero X1R5G5B5 modes even when the
+     * 16-bit list is healthy, and the app cannot cope with both being populated. Fill in
+     * what a working machine reports, nothing more.
+     *
+     * Set [Display] Fill16BitModeList=0 to turn this off and pass the driver's answer
+     * through untouched.
+     */
     UINT STDMETHODCALLTYPE GetAdapterModeCount(UINT a, D3DFORMAT fmt) override
-    { return real_->GetAdapterModeCount(a, fmt); }
+    {
+        UINT n = real_->GetAdapterModeCount(a, fmt);
+        if (n == 0 && g_fill16 && fmt == D3DFMT_R5G6B5) {
+            n = real_->GetAdapterModeCount(a, D3DFMT_X8R8G8B8);
+            Log("[modes] adapter %u reports no R5G6B5 modes; standing in %u X8R8G8B8 modes", a, n);
+        }
+        return n;
+    }
 
     HRESULT STDMETHODCALLTYPE EnumAdapterModes(UINT a, D3DFORMAT fmt, UINT mode,
                                                D3DDISPLAYMODE* out) override
-    { return real_->EnumAdapterModes(a, fmt, mode, out); }
+    {
+        HRESULT hr = real_->EnumAdapterModes(a, fmt, mode, out);
+
+        /* Re-ask for the count rather than caching the decision: this only runs on the
+         * failure path, and a cache would have to be invalidated on display changes. A
+         * non-empty real list must keep its own end - substituting past it would hand the
+         * caller modes the driver had already refused. */
+        if (FAILED(hr) && g_fill16 && fmt == D3DFMT_R5G6B5 &&
+            real_->GetAdapterModeCount(a, D3DFMT_R5G6B5) == 0) {
+            hr = real_->EnumAdapterModes(a, D3DFMT_X8R8G8B8, mode, out);
+            if (SUCCEEDED(hr) && out) out->Format = D3DFMT_R5G6B5;
+        }
+        return hr;
+    }
 
     HRESULT STDMETHODCALLTYPE GetAdapterDisplayMode(UINT a, D3DDISPLAYMODE* out) override
     { return real_->GetAdapterDisplayMode(a, out); }

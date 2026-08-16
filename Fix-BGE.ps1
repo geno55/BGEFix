@@ -1182,8 +1182,15 @@ function Install-WindowedProxy {
             -IniLines @(
                 '; d3d9_windowed - forces the game out of exclusive fullscreen so Alt+Tab is safe.',
                 '; Mode 0 = windowed   1 = borderless centred (default)   2 = borderless stretched',
+                ';',
+                '; Fill16BitModeList=1 stands in a 16-bit display-mode list for GOG''s launcher and',
+                '; settings app when the driver reports none. Without it, on hardware that does not',
+                '; report 16-bit modes, the settings app shows empty Resolution and Refresh rate',
+                '; dropdowns and the launcher re-runs it instead of starting the game. 0 passes the',
+                '; driver''s answer through untouched.',
                 '[Display]',
                 "Mode=$WindowMode",
+                'Fill16BitModeList=1',
                 '',
                 # Log and Chain live in [General] in every proxy ini this installer writes,
                 # so one file teaches you where to find them in the other.

@@ -217,6 +217,10 @@ exactly one thing: rewrite `D3DPRESENT_PARAMETERS::Windowed` to `TRUE`, zero the
 fullscreen refresh rate (illegal once windowed), and restyle the game window. It does not
 touch aspect ratio, resolution, FOV, or shaders.
 
+It carries one thing that is not about the game at all — a stand-in 16-bit display-mode
+list for GOG's launcher and settings app, which load this DLL because it sits beside them.
+See [the empty Resolution dropdown](#the-empty-resolution-dropdown-and-the-launcher-that-never-starts-the-game).
+
 It applies that edit at **both** places a D3D9 application sets the field:
 
 | Call site | When the game reaches it |
@@ -347,7 +351,8 @@ src\build_test.cmd 15
 
 ```ini
 [Display]
-Mode=1     ; 0 = windowed, 1 = borderless centred, 2 = borderless stretched
+Mode=1                 ; 0 = windowed, 1 = borderless centred, 2 = borderless stretched
+Fill16BitModeList=1    ; 0 = report the driver's display modes unchanged
 
 [General]
 Log=0      ; 1 writes d3d9_windowed.log next to the DLL
@@ -362,6 +367,40 @@ in the other. Settings specific to a proxy live in a section named for what they
 Mode 1 preserves the game's aspect ratio, sizing the window to whatever resolution
 `SettingsApplication.exe` is set to. Mode 2 fills the monitor but will distort 4:3 content
 on a 16:9 display, since D3D stretches the backbuffer to the client area.
+
+### The empty Resolution dropdown, and the launcher that never starts the game
+
+Two GOG-supplied executables live in the game folder and load this DLL because it sits
+beside them:
+
+| Executable | What it does |
+| --- | --- |
+| `SettingsApplication.exe` | fills the Resolution and Refresh rate dropdowns |
+| `CheckApplication.exe` | what the GOG shortcut runs; validates the saved settings, then starts either `run.exe` → `BGE.exe`, or the settings app |
+
+Both build their mode list from **one** display format — `D3DFMT_R5G6B5`, 16-bit — and
+neither has a fallback. On hardware where the D3D9 runtime reports no modes in that
+format, two things follow from that single fact:
+
+- the settings app comes up with an **empty Resolution dropdown** and no refresh-rate
+  control at all, while the Video card name fills in correctly;
+- `CheckApplication.exe` cannot validate the mode index the settings app saved, so it
+  **re-runs the settings app on every launch** instead of starting the game. `BGE.exe`
+  carries the same check ("Application settings not correctly set or invalid, please
+  re-run settings application").
+
+None of that is caused by this tool — it reproduces with every file here removed, on a
+copy of `SettingsApplication.exe` alone in an empty folder. On the machine this was
+diagnosed on (Radeon 780M + RTX 4060 hybrid laptop) the runtime's answer is not even
+stable: the same probe binary, run twice seconds apart, reported 119 modes and then 0,
+which is why the same install works one launch and not the next.
+
+So `Fill16BitModeList=1` stands the 32-bit list in when the driver reports no 16-bit one:
+same resolutions, same refresh rates, same order, relabelled — so a mode index the
+settings app saved still means what it meant. Only `D3DFMT_R5G6B5`, and only when the real
+count is zero. `D3DFMT_X1R5G5B5` is deliberately left alone: a build that filled that one
+in too crashed `SettingsApplication.exe` outright, because a healthy driver reports zero
+of those as well. Set it to `0` to pass the driver's answer through untouched.
 
 ---
 

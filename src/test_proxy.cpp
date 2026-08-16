@@ -62,6 +62,128 @@ static void ReadTextFile(const char* path, char* buf, DWORD cap)
     CloseHandle(h);
 }
 
+/* ------------------------------------------------------------------ the launcher's mode list
+ *
+ * GOG's CheckApplication.exe and SettingsApplication.exe build their display-mode list
+ * from D3DFMT_R5G6B5 alone. When the driver reports no modes in that format, the settings
+ * app shows empty Resolution and Refresh rate dropdowns and the launcher stops starting
+ * the game, so the proxy stands the 32-bit list in for it.
+ *
+ * Whether this machine's driver reports 16-bit modes is not something a test can decide -
+ * on the machine this was written for the answer changes between runs of the same binary -
+ * so nothing here asserts a number. Everything is asserted against the SYSTEM d3d9,
+ * loaded alongside the proxy, as an invariant that holds either way:
+ *
+ *   the 32-bit list is passed through untouched, always
+ *   X1R5G5B5 is passed through untouched, always - filling that one in as well crashed
+ *     SettingsApplication.exe, because a healthy driver reports zero of them too
+ *   a real 16-bit list is passed through untouched, including where it ends
+ *   an empty one is replaced by the 32-bit list, relabelled, same order
+ *   Fill16BitModeList=0 turns all of it off
+ */
+static void TestLegacyModeListFill(void)
+{
+    char ini[MAX_PATH], sys[MAX_PATH], detail[256];
+
+    printf("\n  -- 16-bit mode list for GOG's launcher and settings app --\n");
+
+    UINT n = GetSystemDirectoryA(sys, MAX_PATH);
+    lstrcpyA(sys + n, "\\d3d9.dll");
+
+    HMODULE mReal  = LoadLibraryA(sys);
+    HMODULE mProxy = LoadLibraryA("d3d9.dll");
+    check("system d3d9 loads for comparison", mReal != NULL, sys);
+    if (!mReal || !mProxy) return;
+
+    typedef IDirect3D9* (WINAPI *PFN)(UINT);
+    PFN createReal  = (PFN)GetProcAddress(mReal,  "Direct3DCreate9");
+    PFN createProxy = (PFN)GetProcAddress(mProxy, "Direct3DCreate9");
+    if (!createReal || !createProxy) { check("both entry points resolve", 0, ""); return; }
+
+    IDirect3D9* real = createReal(D3D_SDK_VERSION);
+    if (!real) { check("system Direct3DCreate9 returns object", 0, ""); return; }
+
+    const UINT r32 = real->GetAdapterModeCount(D3DADAPTER_DEFAULT, D3DFMT_X8R8G8B8);
+    const UINT r16 = real->GetAdapterModeCount(D3DADAPTER_DEFAULT, D3DFMT_R5G6B5);
+    const UINT r15 = real->GetAdapterModeCount(D3DADAPTER_DEFAULT, D3DFMT_X1R5G5B5);
+    wsprintfA(detail, "driver reports X8R8G8B8=%u R5G6B5=%u X1R5G5B5=%u", r32, r16, r15);
+    printf("       %s\n", detail);
+
+    /* Default state: no ini beside the DLL means the fill is on, which is what the
+     * installer writes explicitly. */
+    PathBesideExe(ini, "d3d9_windowed.ini");
+    DeleteFileA(ini);
+    WritePrivateProfileStringA(NULL, NULL, NULL, ini);   /* drop Windows' ini cache */
+
+    IDirect3D9* proxy = createProxy(D3D_SDK_VERSION);
+    if (!proxy) { check("proxy Direct3DCreate9 returns object", 0, ""); real->Release(); return; }
+
+    const UINT p32 = proxy->GetAdapterModeCount(D3DADAPTER_DEFAULT, D3DFMT_X8R8G8B8);
+    const UINT p16 = proxy->GetAdapterModeCount(D3DADAPTER_DEFAULT, D3DFMT_R5G6B5);
+    const UINT p15 = proxy->GetAdapterModeCount(D3DADAPTER_DEFAULT, D3DFMT_X1R5G5B5);
+
+    wsprintfA(detail, "proxy=%u driver=%u", p32, r32);
+    check("32-bit mode list is passed through untouched", p32 == r32, detail);
+
+    wsprintfA(detail, "proxy=%u driver=%u", p15, r15);
+    check("X1R5G5B5 is left alone (filling it crashes the settings app)", p15 == r15, detail);
+
+    if (r16 == 0) {
+        wsprintfA(detail, "proxy=%u driver=0, X8R8G8B8=%u", p16, r32);
+        check("empty 16-bit list is stood in for by the 32-bit one", p16 == r32, detail);
+
+        /* Same resolutions in the same order, so a mode INDEX saved by the settings app
+         * still means what it meant when the driver was reporting a real 16-bit list. */
+        D3DDISPLAYMODE fromProxy, fromReal;
+        ZeroMemory(&fromProxy, sizeof(fromProxy));
+        ZeroMemory(&fromReal, sizeof(fromReal));
+        HRESULT hp = proxy->EnumAdapterModes(D3DADAPTER_DEFAULT, D3DFMT_R5G6B5, 0, &fromProxy);
+        HRESULT hr = real->EnumAdapterModes(D3DADAPTER_DEFAULT, D3DFMT_X8R8G8B8, 0, &fromReal);
+        check("the stand-in enumerates", SUCCEEDED(hp) && SUCCEEDED(hr), "");
+        if (SUCCEEDED(hp) && SUCCEEDED(hr)) {
+            wsprintfA(detail, "%ux%u@%u vs %ux%u@%u",
+                      fromProxy.Width, fromProxy.Height, fromProxy.RefreshRate,
+                      fromReal.Width, fromReal.Height, fromReal.RefreshRate);
+            check("stand-in modes match the 32-bit list, index for index",
+                  fromProxy.Width == fromReal.Width && fromProxy.Height == fromReal.Height &&
+                  fromProxy.RefreshRate == fromReal.RefreshRate, detail);
+            wsprintfA(detail, "format=%d", (int)fromProxy.Format);
+            check("stand-in modes are labelled 16-bit, as asked for",
+                  fromProxy.Format == D3DFMT_R5G6B5, detail);
+        }
+    }
+    else {
+        wsprintfA(detail, "proxy=%u driver=%u", p16, r16);
+        check("a real 16-bit list is passed through untouched", p16 == r16, detail);
+    }
+
+    /* Whichever branch produced the list, it has to END somewhere: one past the count must
+     * still fail, or the caller is handed modes the driver refused. */
+    D3DDISPLAYMODE past;
+    ZeroMemory(&past, sizeof(past));
+    check("enumerating past the end still fails",
+          FAILED(proxy->EnumAdapterModes(D3DADAPTER_DEFAULT, D3DFMT_R5G6B5, p16, &past)), "");
+
+    proxy->Release();
+
+    /* The off switch. Config is read in Direct3DCreate9, so a second call picks it up. */
+    WriteTextFile(ini, "[Display]\r\nMode=1\r\nFill16BitModeList=0\r\n\r\n[General]\r\nLog=0\r\n");
+    WritePrivateProfileStringA(NULL, NULL, NULL, ini);
+
+    IDirect3D9* off = createProxy(D3D_SDK_VERSION);
+    if (off) {
+        UINT o16 = off->GetAdapterModeCount(D3DADAPTER_DEFAULT, D3DFMT_R5G6B5);
+        wsprintfA(detail, "proxy=%u driver=%u", o16, r16);
+        check("Fill16BitModeList=0 passes the driver's answer through", o16 == r16, detail);
+        off->Release();
+    }
+    else check("proxy still creates with the fill disabled", 0, "");
+
+    DeleteFileA(ini);
+    WritePrivateProfileStringA(NULL, NULL, NULL, ini);
+    real->Release();
+}
+
 /* ------------------------------------------------------------------ failure path
  *
  * What the proxy does when it cannot allocate a wrapper. That branch decides whether the
@@ -326,6 +448,7 @@ int main(void)
     DestroyWindow(hwnd);
     if (decoy) DestroyWindow(decoy);
 
+    TestLegacyModeListFill();
     TestOomIsLoud();
 
     printf("\n  %s (%d failures)\n", g_fail ? "FAILED" : "ALL PASS", g_fail);
