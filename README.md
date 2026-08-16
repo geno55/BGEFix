@@ -60,9 +60,10 @@ rebuilding the database. So this tool rebuilds it:
    so there is no device to lose in the first place. This addresses the *original* bug,
    not just the symptom — without it, Alt+Tab works but the HUD can still corrupt.
 
-A desktop launcher using `start /affinity` is still created as a convenience, but it is no
-longer how affinity is applied. If the replacement database cannot be built or does not
-register, the tool falls back to that launcher and says so.
+Nothing is added to your desktop. Both fixes are properties of `BGE.exe` applied by Windows
+itself, so it does not matter how you start the game. If the replacement database cannot be
+built or does not register, the tool says so loudly rather than quietly handing you a
+shortcut you would have to remember to use.
 
 Every change is backed up and reversible.
 
@@ -122,10 +123,9 @@ powershell -ExecutionPolicy Bypass -File .\Fix-BGE.ps1 -Revert
 | `-GamePath <path>` | auto-detect | Install folder. Found via the GOG registry entry or common locations. |
 | `-Status` | — | Report current state and exit. Changes nothing. |
 | `-Revert` | — | Undo all changes. |
-| `-AffinityMask <int>` | `1` | CPU bitmask for the launcher. `1` = first core (matches the shim). `3` = first two cores. |
 | `-WindowMode <0-2>` | `1` | 0 = windowed, 1 = borderless centred, 2 = borderless stretched. |
 | `-ProxyPath <path>` | `dist\d3d9.dll` | Prebuilt proxy to install. Verified 32-bit before use. |
-| `-Component <list>` | `AltTab,Windowed,Shortcut` | Which parts to act on — see below. `All` selects everything. Also applies to `-Revert`, where it defaults to `All`. |
+| `-Component <list>` | `AltTab,Windowed` | Which parts to act on — see below. `All` selects everything. Also applies to `-Revert`, where it defaults to `All`. |
 | `-PadLookSpeed <100-20000>` | `1800` | Right-stick look speed, in mouse counts per second at full deflection. Frame-rate independent. |
 | `-PadDeadzone <0-32000>` | `7849` | Left-stick deadzone, raw XInput units. Default is XInput's recommended value. |
 | `-PadLookDeadzone <0-32000>` | `8689` | Right-stick deadzone, raw XInput units. Default is XInput's recommended value. |
@@ -147,7 +147,6 @@ to do with Alt+Tab. Each is selected by name, with one polarity:
 | `AltTab` | Replaces GOG's shim database with one applying only `SingleProcAffinity` | no |
 | `Windowed` | Installs the d3d9 proxy, ending exclusive fullscreen | no |
 | `Controller` | Installs the dinput8 XInput proxy | **no** |
-| `Shortcut` | Creates the desktop launcher (convenience only) | no |
 
 ```bash
 powershell -ExecutionPolicy Bypass -File .\Fix-BGE.ps1 -Component Controller
@@ -167,10 +166,11 @@ nothing, where a silent remap of a misread flag would not be.
 
 | Was | Now |
 |---|---|
-| *(default)* | *(unchanged)* |
-| `-NoShortcut` | `-Component AltTab,Windowed` |
-| `-NoWindowedProxy` | `-Component AltTab,Shortcut` |
+| *(default)* | *(unchanged, minus the desktop shortcut)* |
+| `-NoShortcut` | *(now the only behaviour — the launcher is gone)* |
+| `-NoWindowedProxy` | `-Component AltTab` |
 | `-InstallControllerSupport` | `-Component All` |
+| `-AffinityMask <n>` | *(removed with the launcher; the shim pins one core)* |
 | — | `-Component Controller` (new: gamepad only) |
 
 **Contradictions are now binding errors**, not silently-resolved precedence. `-Status`,
@@ -199,9 +199,10 @@ script:
   returned immediately, so the caller always saw success.
 - **`-Force` actually runs unattended.** The elevated window closes on its own. Without
   `-Force` it pauses on a keypress instead, so you can read the summary.
-- **The shortcut lands on your desktop, not the administrator's.** On a standard account
-  UAC elevates into a different account; the desktop is resolved before elevating and
-  passed down, so `-Status` run unelevated afterwards agrees with what was installed.
+- **Nothing is written to a user profile**, so it does not matter that UAC elevates into a
+  different account on a standard user. Everything the tool installs is machine-scope or
+  lives in the game folder, and `-Status` run unelevated afterwards sees exactly what was
+  installed.
 
 ```bash
 powershell -ExecutionPolicy Bypass -File .\Fix-BGE.ps1 -Force
@@ -457,7 +458,6 @@ regenerate the file, or add a `LookSpeed` line yourself.
 | Change | Location |
 |---|---|
 | Shim database replaced | `HKLM\...\AppCompatFlags\Custom\BGE.exe` + `%WINDIR%\AppPatch\CustomSDB\` |
-| Launcher shortcut created | `%USERPROFILE%\Desktop\Beyond Good & Evil (BGEFix).lnk` — only with the `Shortcut` component |
 | Proxy + config installed | `<game>\d3d9.dll`, `<game>\d3d9_windowed.ini` — only with the `Windowed` component |
 | Controller proxy + config | `<game>\dinput8.dll`, `<game>\dinput8_xinput.ini` — only with the `Controller` component |
 | Pre-existing DLLs renamed | `<game>\d3d9_chain.dll`, `<game>\dinput8_chain.dll` (restored on `-Revert`) |
@@ -468,22 +468,23 @@ reversible even if the backup directory is deleted.
 
 ### Upgrading from an older version
 
-The state directory and the shortcut were renamed, and **nothing is migrated**. If you
-applied the fix with an older build, revert with *that* build first. Otherwise the old
-`%ProgramData%\BGEAltTabFix\` and `Beyond Good & Evil (Alt+Tab Fix).lnk` are stranded:
-this version does not know about them, `-Revert` will not touch them, and deleting them is
-a manual job.
+The state directory was renamed and the desktop launcher removed, and **nothing is
+migrated**. If you applied the fix with an older build, revert with *that* build first.
+Otherwise the old `%ProgramData%\BGEAltTabFix\` and any
+`Beyond Good & Evil (Alt+Tab Fix).lnk` are stranded: this version does not know about them,
+`-Revert` will not touch them, and deleting them is a manual job.
 
 ## Important limitations
 
-**Start the game however you like.** Both halves are machine-wide: Alt+Tab is fixed because
+**Start the game however you like.** Both fixes are machine-wide: Alt+Tab is fixed because
 GOG's database is gone, and single-core pinning still applies because the replacement
-database applies `SingleProcAffinity` to `BGE.exe` itself. GOG Galaxy, the Start Menu, the
-original desktop icon and the new launcher all behave the same.
+database applies `SingleProcAffinity` to `BGE.exe` itself. GOG Galaxy, the Start Menu and
+the original desktop icon all behave the same, and there is no special launcher to
+remember.
 
-The exception is if the replacement database could not be installed — the tool warns
-loudly when that happens and falls back to the launcher shortcut, and only then does it
-matter which icon you use. `-Status` always shows which of the two is in force.
+If the replacement database could not be installed, the tool says so loudly and the game
+is left unpinned — it does not silently substitute something weaker. `-Status` always
+reports which state you are in.
 
 **Reinstalling the game restores the shim.** GOG's installer gates the shim install behind
 a `DoSDBOnce1207658746=1` flag in `goglog.ini`. A fresh install or a repair can re-register
@@ -494,7 +495,8 @@ it. Just re-run this script — see below.
 Re-running is safe and is the supported way to repair or upgrade an install. Specifically:
 
 - Removing the shim is skipped when it is already gone.
-- The launcher shortcut is rewritten in place.
+- The replacement shim database is reinstalled over itself; its GUID is fixed, so
+  re-running replaces rather than accumulating registrations.
 - A proxy already installed is replaced by the current build. Our DLLs carry an embedded
   marker, so an upgraded build recognises an older build of itself rather than mistaking
   it for a third-party wrapper and chaining to it. See below.
@@ -591,19 +593,25 @@ of those fields byte-identical so the shim still matches, and keeps working if G
 the database. It also means the tool preserves any *other* shim the database applies —
 only `IgnoreAltTab` is removed, rather than a hardcoded set being reimposed.
 
-## The purist alternative
+## The launcher shortcut, and why it is gone
 
-Earlier versions of this tool replaced `SingleProcAffinity` with a desktop shortcut and
-described rebuilding the database as a "purist alternative" needing the
-[Windows ADK](https://learn.microsoft.com/en-us/windows-hardware/get-started/adk-install)'s
-Compatibility Administrator. That was a downgrade dressed up as a replacement: a shim the
-OS applied unconditionally became something the user had to remember to click, and
-`-NoShortcut` silently meant "no affinity at all".
+Earlier versions replaced `SingleProcAffinity` with a desktop shortcut using
+`start /affinity`, and described rebuilding the database as a "purist alternative" needing
+the [Windows ADK](https://learn.microsoft.com/en-us/windows-hardware/get-started/adk-install)'s
+Compatibility Administrator.
 
-It is also not true that the ADK is required. Compatibility Administrator *authors* an
-`.sdb`; it is not needed to *edit* one. The tool now rebuilds the database itself — see
-above — so the surgical fix is the default and there is no purist alternative left to
-describe.
+Both halves of that were wrong. The shortcut was a downgrade dressed up as a replacement:
+a shim the OS applied unconditionally became something you had to remember to click, and
+`-NoShortcut` silently meant "no affinity at all". And the ADK was never required —
+Compatibility Administrator *authors* an `.sdb`, it is not needed to *edit* one.
+
+Once the replacement database landed, the shortcut had nothing left to do. It survived
+briefly as a "convenience" that duplicated GOG's own desktop icon, and as a fallback for a
+failed database install — but falling back to it would have meant reporting success while
+delivering something weaker than what GOG shipped. It is now removed entirely, along with
+`-AffinityMask`, `New-AffinityShortcut`, and the machinery for resolving the invoking
+user's desktop across a UAC elevation. That last item was a genuine source of bugs and
+existed solely to place this one file.
 
 ## Credits
 

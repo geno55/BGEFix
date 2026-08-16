@@ -19,6 +19,12 @@ param()
 
 $ErrorActionPreference = 'Stop'
 
+# Match the installer's own strictness. Without this the harness silently tolerates
+# reading an unset variable or a missing property, while the real script - which sets
+# StrictMode 2.0 - dies on it. That gap shipped a crash in Initialize-SdbApi: the tests
+# exercised the function happily and the first real apply failed on its first line.
+Set-StrictMode -Version 2.0
+
 $repo = Split-Path -Parent $PSScriptRoot
 $src  = Join-Path $repo 'Fix-BGE.ps1'
 $tmp  = Join-Path ([System.IO.Path]::GetTempPath()) ("bgefix-installer-test-" + [guid]::NewGuid().ToString('N'))
@@ -31,7 +37,8 @@ $want = 'ConvertTo-ProcessArgument', 'Invoke-SelfElevate',
         'Test-Pe32', 'Get-ProxyMarkerVersion', 'Test-IsOurProxy',
         'Initialize-SdbApi', 'Get-SdbTagString', 'Get-SdbChildString', 'Get-SdbContents',
         'Get-SdbNodes', 'New-AffinityOnlySdb', 'Read-SdbRawString',
-        'Get-UnaccountedShims', 'Show-Status', 'Show-SdbInventory', 'Get-UserDesktop',
+        'Get-UnaccountedShims', 'Show-Status', 'Show-SdbInventory',
+        'Get-StateValue',
         'Write-Head', 'Write-Step', 'Write-Ok', 'Write-Warn2', 'Write-Bad', 'Write-Info'
 $fns  = $ast.FindAll({
     param($n)
@@ -42,7 +49,10 @@ if ($fns.Count -ne $want.Count) {
 }
 foreach ($f in $fns) { . ([scriptblock]::Create($f.Extent.Text)) }
 
-foreach ($line in (Select-String -Path $src -Pattern '^\$script:(ProxyMarkerPrefix|ProxyMarkerVersion|LegacyProxyMarkers|BadShim|GoodShim|ShortcutName|AffinityDbGuid|AffinityDbName|AffinityDbFile)\s*=')) {
+# Every top-level $script: assignment, not a hand-picked list. A list drifts: it silently
+# omitted the SdbApiReady/SdbApiTried declarations, so the harness saw a different
+# initial state than the real script and could not reproduce a StrictMode failure in it.
+foreach ($line in (Select-String -Path $src -Pattern '^\$script:\w+\s*=')) {
     . ([scriptblock]::Create($line.Line))
 }
 
@@ -272,10 +282,12 @@ try {
     # stub rather than leave that path unexercised on a machine that has none.
     Write-Host ''
     Write-Host '  -- -Status renders the inventory --'
+    # Must carry every property Show-Status reads: under StrictMode a missing one is a
+    # terminating error, so a stub that is merely close hides real breakage.
     function Get-BgeShimDatabase {
         [pscustomobject]@{
             Guid = '{test}'; Path = 'C:\test.sdb'; Description = 'Reissued DB'
-            Readable = $true; Shims = @($c.Shims); UnknownShims = @($unacc)
+            Readable = $true; IsOurs = $false; Shims = @($c.Shims); UnknownShims = @($unacc)
             HasBadShim = $true; Entries = @($c.Entries)
         }
     }
@@ -291,12 +303,29 @@ try {
     function Get-BgeShimDatabase {
         [pscustomobject]@{
             Guid = '{test}'; Path = 'C:\bad.sdb'; Description = 'Unreadable'
-            Readable = $false; Shims = @(); UnknownShims = @(); HasBadShim = $false; Entries = @()
+            Readable = $false; IsOurs = $false; Shims = @(); UnknownShims = @()
+            HasBadShim = $false; Entries = @()
         }
     }
     $rendered = (Show-Status -Folder $tmp 6>&1 | Out-String)
     Check 'an unreadable database is reported as unknown, not empty' `
           ($rendered -match 'COULD NOT BE READ') ''
+
+    # state.json is data on disk and may be older, truncated or hand-edited. Under
+    # StrictMode a missing property is a terminating error, so reading it has to be
+    # guarded - a revert must not die precisely when the state file matters most.
+    Check 'a missing state field reads as empty, not an error' `
+          ((Get-StateValue $null 'Anything') -eq '' -and
+           (Get-StateValue ([pscustomobject]@{ A = 1 }) 'B') -eq '' -and
+           (Get-StateValue ([pscustomobject]@{ A = $null }) 'A') -eq '') ''
+    Check 'a present state field is returned' `
+          ((Get-StateValue ([pscustomobject]@{ ShortcutPath = 'C:\x.lnk' }) 'ShortcutPath') -eq 'C:\x.lnk') ''
+
+    function Get-State { [pscustomobject]@{ GamePath = 'C:\somewhere' } }   # no ShortcutPath
+    $ok = $true
+    try { $null = Show-Status -Folder $tmp 6>&1 | Out-String } catch { $ok = $false }
+    Check 'a partial state file does not crash -Status' $ok ''
+    function Get-State { $null }
 
     # Against the genuine article, when this machine has one.
     $script:goggame = 'C:\GOG Games\Beyond Good and Evil\goggame.sdb'
@@ -490,15 +519,13 @@ public static extern IntPtr LocalFree(IntPtr hMem);
     }
 
     $bound = @{ GamePath = 'D:\Games\BGE\'; Force = [switch]$true; NoElevate = [switch]$true }
-    $code = Invoke-SelfElevate -Bound $bound -Desktop 'C:\Users\real\Desktop' 6>&1 | Select-Object -Last 1
+    $code = Invoke-SelfElevate -Bound $bound 6>&1 | Select-Object -Last 1
     $code = [int]("$code")
 
     Check "the child's exit code is propagated, not swallowed" ($code -eq 3) "got $code"
 
     $args = @($script:capturedArgs)
     Check 'the child is told it was relaunched' ($args -contains '-ElevatedRelaunch') ''
-    Check "the invoking user's desktop is forwarded" `
-          (($args -contains '-DesktopPath') -and ($args -contains '"C:\Users\real\Desktop"')) ''
     Check '-NoExit is not used, so -Force can run unattended' (-not ($args -contains '-NoExit')) ''
     Check '-NoElevate is not forwarded, so the child cannot bounce' (-not ($args -contains '-NoElevate')) ''
     Check 'switches are forwarded without a value' ($args -contains '-Force') ''
@@ -512,15 +539,15 @@ public static extern IntPtr LocalFree(IntPtr hMem);
     Write-Host ''
     Write-Host '  -- component selection --'
 
-    Check 'the default install is unchanged' `
-          ((@(Resolve-Components) -join ',') -eq 'AltTab,Windowed,Shortcut') `
+    Check 'installing defaults to AltTab and Windowed' `
+          ((@(Resolve-Components) -join ',') -eq 'AltTab,Windowed') `
           (@(Resolve-Components) -join ',')
-    Check 'All means all four' `
-          (@(Resolve-Components -Requested @('All')).Count -eq 4) ''
+    Check 'All means all three' `
+          (@(Resolve-Components -Requested @('All')).Count -eq 3) ''
     Check 'controller support can be installed on its own' `
           ((@(Resolve-Components -Requested @('Controller')) -join ',') -eq 'Controller') ''
     Check 'a revert defaults to everything' `
-          (@(Resolve-Components -ForRevert).Count -eq 4) ''
+          (@(Resolve-Components -ForRevert).Count -eq 3) ''
 
     # Tuning for a component that is not being installed must be an error, not ignored.
     $threw = $false

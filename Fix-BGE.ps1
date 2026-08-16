@@ -31,8 +31,8 @@
         (Xbox) gamepad support. The GOG build has no gamepad code at all. Nothing
         to do with Alt+Tab, and installable on its own.
 
-    A desktop launcher (the Shortcut component) is created as a convenience; it is
-    not how affinity is applied.
+    Nothing is added to your desktop, and it does not matter how you launch the game:
+    both fixes are properties of BGE.exe applied by Windows itself.
 
     Every change is backed up and reversible with -Revert.
 
@@ -41,15 +41,11 @@
     registry entry or common install locations when omitted.
 
 .PARAMETER Revert
-    Undo changes: restore GOG's original shim database, remove the launcher
-    shortcut, and remove the proxies. Narrow it with -Component.
+    Undo changes: restore GOG's original shim database and remove the proxies.
+    Narrow it with -Component.
 
 .PARAMETER Status
     Report the current state and exit without changing anything.
-
-.PARAMETER AffinityMask
-    CPU affinity bitmask for the launcher shortcut. Default 1 (first core only),
-    matching what the SingleProcAffinity shim does. Use 3 for the first two cores.
 
 .PARAMETER Component
     Which parts to install, or with -Revert, which parts to undo. One list, one
@@ -60,10 +56,9 @@
         Windowed    The d3d9 proxy that takes the game out of exclusive fullscreen.
         Controller  The dinput8 proxy that adds XInput gamepad support. Unrelated to
                     Alt+Tab, and installable on its own: -Component Controller.
-        Shortcut    A desktop launcher. Convenience only; affinity comes from AltTab.
-        All         All four.
+        All         All three.
 
-    Default when installing: AltTab, Windowed, Shortcut. Default when reverting: All.
+    Default when installing: AltTab, Windowed. Default when reverting: All.
 
 .PARAMETER ProxyPath
     Path to a prebuilt proxy DLL. Defaults to dist\d3d9.dll beside this script.
@@ -165,10 +160,9 @@ param(
     #   AltTab     - remove GOG's shim database, install the affinity-only replacement
     #   Windowed   - the d3d9 windowed proxy
     #   Controller - the dinput8 XInput proxy (independent of everything else)
-    #   Shortcut   - the convenience desktop launcher
     [Parameter(ParameterSetName = 'Apply')]
     [Parameter(ParameterSetName = 'Revert')]
-    [ValidateSet('AltTab', 'Windowed', 'Controller', 'Shortcut', 'All')]
+    [ValidateSet('AltTab', 'Windowed', 'Controller', 'All')]
     [string[]] $Component,
 
     [Parameter(ParameterSetName = 'Status', Mandatory = $true)]
@@ -178,9 +172,6 @@ param(
     [switch]   $Revert,
 
     # --- apply-only tuning. Absent from Status and Revert, so passing one there is an error.
-    [Parameter(ParameterSetName = 'Apply')]
-    [int]      $AffinityMask = 1,
-
     [Parameter(ParameterSetName = 'Apply')]
     [string]   $ProxyPath,
 
@@ -214,9 +205,8 @@ param(
     [switch]   $Force,
 
     # Internal. Set when this script relaunched itself elevated, so the child knows to
-    # pause before its console closes, and which desktop belongs to the real user.
-    [switch]   $ElevatedRelaunch,
-    [string]   $DesktopPath
+    # pause before its console closes rather than vanishing with the summary.
+    [switch]   $ElevatedRelaunch
 )
 
 Set-StrictMode -Version 2.0
@@ -229,9 +219,6 @@ $script:StateDir     = Join-Path $env:ProgramData 'BGEFix'
 $script:BackupDir    = Join-Path $script:StateDir  'backup'
 $script:StateFile    = Join-Path $script:StateDir  'state.json'
 
-# Qualified rather than just "Beyond Good & Evil.lnk" so it cannot collide with the
-# shortcut GOG's own installer puts on the desktop.
-$script:ShortcutName = 'Beyond Good & Evil (BGEFix).lnk'
 
 # The shim we are targeting, and the one we must preserve the effect of.
 $script:BadShim      = 'IgnoreAltTab'
@@ -242,10 +229,6 @@ $script:GogGameId    = '1207658746'
 
 $script:CustomKey    = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Custom'
 $script:InstalledKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\InstalledSDB'
-
-# Documented launch chain. Affinity set on the first present entry is inherited
-# by everything it spawns.
-$script:LaunchChain  = @('CheckApplication.exe', 'run.exe', 'BGE.exe')
 
 # Embedded in dist\d3d9.dll and dist\dinput8.dll by src\*.cpp, so the installer can
 # recognise ANY build of its own proxies rather than just the one it shipped with.
@@ -265,10 +248,6 @@ $script:LegacyProxyMarkers = @('BGEFIX_PROXY_V1')
 # The replacement shim database: GOG's own, minus IgnoreAltTab. Fixed GUID so re-running
 # replaces our previous install rather than accumulating registrations, and a distinct
 # name so it is obvious in -Status and in Installed Programs whose database it is.
-# Set from -DesktopPath when this script was relaunched elevated. See Get-UserDesktop.
-$script:DesktopOverride = ''
-if ($DesktopPath -and (Test-Path -LiteralPath $DesktopPath)) { $script:DesktopOverride = $DesktopPath }
-
 $script:AffinityDbGuid = [guid]'7b3f4d21-9c58-4a06-9e77-1d2b8a5f6c34'
 $script:AffinityDbName = 'BGEFix (SingleProcAffinity only)'
 $script:AffinityDbFile = 'bge_affinity_only.sdb'
@@ -304,13 +283,14 @@ function Resolve-Components {
     <#
         Works out which parts to act on and returns them as a set.
 
-        Defaults preserve what the tool did before: the Alt+Tab fix, the windowed proxy
-        and the shortcut, but not controller support. -Component All adds the controller.
-        Reverting defaults to everything, because a partial revert has to be asked for.
+        Installing defaults to the Alt+Tab fix and the windowed proxy, but not controller
+        support - that one is opt-in because it is unrelated to the rest. -Component All
+        adds it. Reverting defaults to everything, because a partial revert has to be
+        asked for.
     #>
     param([string[]]$Requested, [switch]$ForRevert)
 
-    $all = @('AltTab', 'Windowed', 'Controller', 'Shortcut')
+    $all = @('AltTab', 'Windowed', 'Controller')
 
     if ($Requested) {
         if ($Requested -contains 'All') { return $all }
@@ -318,7 +298,7 @@ function Resolve-Components {
     }
 
     if ($ForRevert) { return $all }
-    return @('AltTab', 'Windowed', 'Shortcut')
+    return @('AltTab', 'Windowed')
 }
 
 function Assert-ComponentOptions {
@@ -335,7 +315,6 @@ function Assert-ComponentOptions {
     $rules = @(
         @{ Params = @('WindowMode', 'ProxyPath');                                        Needs = 'Windowed' }
         @{ Params = @('PadPath', 'PadLookSpeed', 'PadDeadzone', 'PadLookDeadzone', 'PadInvertLook'); Needs = 'Controller' }
-        @{ Params = @('AffinityMask');                                                   Needs = 'Shortcut' }
     )
 
     foreach ($rule in $rules) {
@@ -353,22 +332,6 @@ function Assert-ComponentOptions {
         throw ('-ResetConfig regenerates the proxy .ini files, and this run installs neither ' +
                'proxy. Add Windowed or Controller, or drop -ResetConfig.')
     }
-}
-
-function Get-UserDesktop {
-    <#
-        The desktop of the user who asked for this, not of whoever we are running as.
-
-        On a standard account UAC elevates into a different account entirely, so a
-        GetFolderPath('Desktop') taken inside the elevated process points at the
-        administrator's desktop. The shortcut landed there, and then -Status - run
-        unelevated, as the real user - reported "Affinity launcher not present". Two
-        halves of the same tool disagreeing about who the user is.
-
-        The unelevated parent resolves it before relaunching and passes it down.
-    #>
-    if ($script:DesktopOverride) { return $script:DesktopOverride }
-    return [Environment]::GetFolderPath('Desktop')
 }
 
 function ConvertTo-ProcessArgument {
@@ -414,10 +377,7 @@ function Invoke-SelfElevate {
         the flag that exists for unattended use, leave a console open forever. The child
         is told it was relaunched instead, and pauses itself only when interactive.
     #>
-    param(
-        [System.Collections.IDictionary]$Bound,
-        [string]$Desktop
-    )
+    param([System.Collections.IDictionary]$Bound)
 
     $argList = @(
         '-NoProfile', '-ExecutionPolicy', 'Bypass',
@@ -427,7 +387,7 @@ function Invoke-SelfElevate {
     if (-not $Bound) { $Bound = @{} }
 
     foreach ($kv in $Bound.GetEnumerator()) {
-        if ($kv.Key -in @('NoElevate', 'ElevatedRelaunch', 'DesktopPath')) { continue }
+        if ($kv.Key -in @('NoElevate', 'ElevatedRelaunch')) { continue }
         if ($kv.Value -is [switch]) {
             if ($kv.Value.IsPresent) { $argList += "-$($kv.Key)" }
         }
@@ -437,13 +397,7 @@ function Invoke-SelfElevate {
         }
     }
 
-    # Hand the child the desktop of the user who actually asked for this. Resolved here,
-    # while we are still running as them - see Get-UserDesktop.
     $argList += '-ElevatedRelaunch'
-    if ($Desktop) {
-        $argList += '-DesktopPath'
-        $argList += (ConvertTo-ProcessArgument $Desktop)
-    }
 
     Write-Warn2 'Administrator rights are required. Relaunching elevated...'
 
@@ -545,6 +499,12 @@ function Resolve-GameFolder {
     }
     throw "Could not locate the Beyond Good & Evil install folder. Re-run with -GamePath '<folder containing BGE.exe>'."
 }
+
+# Bind-once state for Initialize-SdbApi. Declared here rather than assigned on first use:
+# this script runs under Set-StrictMode 2.0, where reading a variable that was never set
+# is a terminating error, not $null.
+$script:SdbApiReady = $false
+$script:SdbApiTried = $false
 
 function Initialize-SdbApi {
     <#
@@ -983,6 +943,24 @@ function Get-State {
     catch { return $null }
 }
 
+function Get-StateValue {
+    <#
+        Reads one field out of the saved state, or '' if it is not there.
+
+        state.json is data on disk, so it may be older, truncated or hand-edited, and this
+        script runs under StrictMode 2.0 where reading a missing property is a terminating
+        error rather than $null. A revert must not die because one field is absent - that
+        is precisely when the state file matters most.
+    #>
+    param($State, [string]$Name)
+
+    if (-not $State) { return '' }
+    if ($State.PSObject.Properties.Name -notcontains $Name) { return '' }
+    $value = $State.$Name
+    if ($null -eq $value) { return '' }
+    return $value
+}
+
 function Save-State {
     param([hashtable]$State)
     if (-not (Test-Path -LiteralPath $script:StateDir)) {
@@ -1007,49 +985,6 @@ function Backup-File {
 #endregion
 
 #region ---------------------------------------------------------------- actions
-
-function Get-LaunchTarget {
-    param([string]$Folder)
-    foreach ($exe in $script:LaunchChain) {
-        $full = Join-Path $Folder $exe
-        if (Test-Path -LiteralPath $full) { return $full }
-    }
-    return (Join-Path $Folder 'BGE.exe')
-}
-
-function New-AffinityShortcut {
-    param([string]$Folder, [int]$Mask)
-
-    $target   = Get-LaunchTarget -Folder $Folder
-    $exeName  = Split-Path $target -Leaf
-    $maskHex  = '{0:X}' -f $Mask
-
-    $desktop  = Get-UserDesktop
-    $linkPath = Join-Path $desktop $script:ShortcutName
-
-    # cmd's `start /affinity` is the only built-in way to set affinity at launch.
-    # The first quoted token is start's window title, not the program - it must be
-    # present or start would treat the path as the title. Keep it free of '&', which
-    # cmd treats as a command separator even inside a /c argument string.
-    $arguments = '/c start "BGE" /affinity {0} /d "{1}" "{2}"' -f $maskHex, $Folder, $exeName
-
-    $shell = New-Object -ComObject WScript.Shell
-    try {
-        $sc = $shell.CreateShortcut($linkPath)
-        $sc.TargetPath       = Join-Path $env:SystemRoot 'System32\cmd.exe'
-        $sc.Arguments        = $arguments
-        $sc.WorkingDirectory = $Folder
-        $sc.IconLocation     = "$(Join-Path $Folder 'BGE.exe'),0"
-        $sc.WindowStyle      = 7   # start minimised so the cmd host does not flash
-        $sc.Description      = 'Beyond Good & Evil with Alt+Tab enabled and single-core affinity'
-        $sc.Save()
-    }
-    finally {
-        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($shell)
-    }
-
-    return [pscustomobject]@{ Path = $linkPath; Target = $exeName; Mask = $Mask }
-}
 
 function Test-Pe32 {
     # BGE.exe is a 32-bit process and silently fails to load a 64-bit DLL, so verify
@@ -1382,22 +1317,8 @@ function Show-Status {
     else {
         Write-Warn2 'No BGE.exe shim database installed'
         Write-Info  "Alt+Tab is not blocked, but '$($script:GoodShim)' is not applied either -"
-        Write-Info  '  affinity depends on launching through the shortcut, if one exists.'
+        Write-Info  '  the game is not pinned to one core. Re-run to install the replacement.'
     }
-
-    # Prefer where it was actually written over where we would write it now: an elevated
-    # apply and an unelevated -Status can otherwise resolve different desktops.
-    $link = Join-Path (Get-UserDesktop) $script:ShortcutName
-    $st = Get-State
-    if ($st -and ($st.PSObject.Properties.Name -contains 'ShortcutPath') -and $st.ShortcutPath) {
-        $link = $st.ShortcutPath
-    }
-    if (Test-Path -LiteralPath $link) {
-        if ($db -and $db.IsOurs) { Write-Ok "Launcher shortcut present (convenience only): $link" }
-        else                     { Write-Ok "Affinity launcher present: $link" }
-    }
-    elseif ($db -and $db.IsOurs) { Write-Info 'No launcher shortcut - not needed, affinity is machine-wide' }
-    else                         { Write-Warn2 "Affinity launcher not present (looked in $link)" }
 
     $proxyIni = Join-Path $Folder 'd3d9_windowed.ini'
     if (Test-Path -LiteralPath $proxyIni) {
@@ -1423,8 +1344,8 @@ function Show-Status {
         Write-Warn2 'Controller support not installed'
     }
 
-    $state = Get-State
-    if ($state) { Write-Info "Fix applied on: $($state.AppliedUtc) UTC" }
+    $applied = Get-StateValue (Get-State) 'AppliedUtc'
+    if ($applied) { Write-Info "Fix applied on: $applied UTC" }
     Write-Host ''
 }
 
@@ -1436,7 +1357,6 @@ function Invoke-Apply {
     $doAltTab     = $Components -contains 'AltTab'
     $doWindowed   = $Components -contains 'Windowed'
     $doController = $Components -contains 'Controller'
-    $doShortcut   = $Components -contains 'Shortcut'
 
     $db = $null
     if ($doAltTab) {
@@ -1472,7 +1392,6 @@ function Invoke-Apply {
         }
         $steps.Add("Install replacement database applying only '$($script:GoodShim)'")
     }
-    if ($doShortcut)   { $steps.Add("Create launcher shortcut (convenience; mask $AffinityMask)") }
     if ($doWindowed)   { $steps.Add("Install d3d9 windowed proxy (window mode $WindowMode)") }
     if ($doController) { $steps.Add('Install dinput8 XInput controller support') }
 
@@ -1502,8 +1421,6 @@ function Invoke-Apply {
         ShimSource     = ''
         AffinityDbGuid = ''
         AffinityDbPath = ''
-        ShortcutPath   = ''
-        AffinityMask   = $AffinityMask
         ProxyTarget    = ''
         ProxyIni       = ''
         ProxyChained   = ''
@@ -1524,7 +1441,6 @@ function Invoke-Apply {
             }
         }
     }
-    if ($doShortcut) { $state.AffinityMask = $AffinityMask }
 
     # ---- 1. shim database ------------------------------------------------
     if ($db) {
@@ -1616,37 +1532,17 @@ function Invoke-Apply {
             }
         }
 
+        # No fallback. A desktop shortcut only pins the runs that go through it, so
+        # offering one here would report success while quietly delivering something
+        # weaker than what GOG shipped. Say what is true instead.
         if (-not $affinityInstalled) {
-            Write-Warn2 "Falling back to the launcher shortcut for '$($script:GoodShim)'."
-            Write-Info  'That only pins runs started from the shortcut.'
+            Write-Warn2 "'$($script:GoodShim)' is NOT applied. GOG's database was removed and the"
+            Write-Warn2 '  replacement could not be installed, so the game is no longer pinned to one core.'
+            Write-Info  '  Expect timing or audio problems. Re-run, or use -Revert to put GOG''s database back.'
         }
     }
 
-    # ---- 2. launcher shortcut -------------------------------------------
-    # Convenience only once the replacement database is in: affinity is already applied by
-    # the OS. It is the fallback path, not the mechanism.
-    if ($doShortcut) {
-        if ($PSCmdlet.ShouldProcess('Desktop shortcut', 'Create launcher')) {
-            $sc = New-AffinityShortcut -Folder $Folder -Mask $AffinityMask
-            Write-Ok "Launcher created: $($sc.Path)"
-            if ($affinityInstalled) {
-                Write-Info "Convenience launcher; affinity is applied by the database regardless."
-            }
-            else {
-                Write-Info "Launches $($sc.Target) with affinity mask $($sc.Mask); BGE.exe inherits it."
-            }
-            $state.ShortcutPath = $sc.Path
-        }
-    }
-    elseif ($affinityInstalled) {
-        Write-Ok "No launcher - not needed, '$($script:GoodShim)' applies machine-wide"
-    }
-    elseif ($doAltTab) {
-        Write-Warn2 'No launcher, and the replacement database is not installed.'
-        Write-Warn2 "'$($script:GoodShim)' is therefore not applied at all."
-    }
-
-    # ---- 3. windowed proxy ----------------------------------------------
+    # ---- 2. windowed proxy ----------------------------------------------
     if ($doWindowed) {
         if ($PSCmdlet.ShouldProcess($Folder, 'Install d3d9 windowed proxy')) {
             $px = Install-WindowedProxy -Folder $Folder
@@ -1678,7 +1574,6 @@ function Invoke-Apply {
         Save-State -State $state
         Write-Host ''
         Write-Ok 'Done.'
-        if ($state.ShortcutPath) { Write-Info 'Launch the game from the new desktop shortcut to keep single-core affinity.' }
         Write-Info "Undo with: .\Fix-BGE.ps1 -Revert"
         Write-Host ''
     }
@@ -1692,8 +1587,7 @@ function Invoke-Revert {
     $doAltTab     = $Components -contains 'AltTab'
     $doWindowed   = $Components -contains 'Windowed'
     $doController = $Components -contains 'Controller'
-    $doShortcut   = $Components -contains 'Shortcut'
-    $partial      = @($Components).Count -lt 4
+    $partial      = @($Components).Count -lt 3
 
     if ($partial) { Write-Info "Reverting only: $($Components -join ', ')" }
 
@@ -1706,9 +1600,8 @@ function Invoke-Revert {
     # Uninstall ours first, otherwise reinstalling GOG's would leave two databases
     # registered for BGE.exe.
     $ourGuid = "{$($script:AffinityDbGuid)}"
-    if ($state -and $state.PSObject.Properties.Name -contains 'AffinityDbGuid' -and $state.AffinityDbGuid) {
-        $ourGuid = $state.AffinityDbGuid
-    }
+    $recordedGuid = Get-StateValue $state 'AffinityDbGuid'
+    if ($recordedGuid) { $ourGuid = $recordedGuid }
     $current = Get-BgeShimDatabase
     if ($doAltTab -and $current -and $current.IsOurs) {
         if ($PSCmdlet.ShouldProcess($ourGuid, 'Uninstall affinity-only database')) {
@@ -1728,8 +1621,9 @@ function Invoke-Revert {
             if (Test-Path -LiteralPath $candidate) { $source = $candidate; break }
         }
 
-        if (-not $source -and $state -and $state.GamePath) {
-            $shipped = Join-Path $state.GamePath 'goggame.sdb'
+        $recordedGame = Get-StateValue $state 'GamePath'
+        if (-not $source -and $recordedGame) {
+            $shipped = Join-Path $recordedGame 'goggame.sdb'
             if (Test-Path -LiteralPath $shipped) { $source = $shipped }
         }
 
@@ -1747,18 +1641,6 @@ function Invoke-Revert {
     }
     elseif ($doAltTab) {
         Write-Ok 'Shim database already installed - nothing to restore'
-    }
-
-    # ---- shortcut --------------------------------------------------------
-    if ($doShortcut) {
-        $link = Join-Path (Get-UserDesktop) $script:ShortcutName
-        if ($state -and $state.ShortcutPath) { $link = $state.ShortcutPath }
-        if (Test-Path -LiteralPath $link) {
-            if ($PSCmdlet.ShouldProcess($link, 'Remove launcher shortcut')) {
-                Remove-Item -LiteralPath $link -Force
-                Write-Ok 'Launcher shortcut removed'
-            }
-        }
     }
 
     # ---- proxy DLLs ------------------------------------------------------
@@ -1800,7 +1682,6 @@ function Invoke-Revert {
 
             $clear = @()
             if ($doAltTab)     { $clear += @('ShimGuid', 'ShimBackup', 'ShimSource', 'AffinityDbGuid', 'AffinityDbPath') }
-            if ($doShortcut)   { $clear += @('ShortcutPath') }
             if ($doWindowed)   { $clear += @('ProxyTarget', 'ProxyIni', 'ProxyChained') }
             if ($doController) { $clear += @('PadTarget', 'PadIni', 'PadChained') }
             foreach ($k in $clear) { if ($keep.ContainsKey($k)) { $keep[$k] = '' } }
@@ -1853,9 +1734,7 @@ try {
         else {
             # $PSBoundParameters must be read here, in script scope, not inside the function.
             # The desktop is resolved here too, while we are still the invoking user.
-            $code = Invoke-SelfElevate -Bound $PSBoundParameters `
-                                       -Desktop ([Environment]::GetFolderPath('Desktop'))
-            exit $code
+            exit (Invoke-SelfElevate -Bound $PSBoundParameters)
         }
     }
 
