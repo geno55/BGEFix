@@ -194,7 +194,20 @@ static FARPROC ChainProc(const char* name)
 
 /* ------------------------------------------------------------------ window restyle */
 
-static void ApplyWindowMode(HWND hwnd, UINT bbW, UINT bbH)
+/* Does the foreground window belong to this process? Used to decide whether reasserting
+ * the window mode may also take focus, or must leave it alone. */
+static BOOL OwnsForeground(HWND hwnd)
+{
+    HWND fg = GetForegroundWindow();
+    if (!fg || !hwnd) return FALSE;
+
+    DWORD fgPid = 0, ourPid = 0;
+    GetWindowThreadProcessId(fg, &fgPid);
+    GetWindowThreadProcessId(hwnd, &ourPid);
+    return (fgPid != 0 && fgPid == ourPid);
+}
+
+static void ApplyWindowMode(HWND hwnd, UINT bbW, UINT bbH, BOOL activate)
 {
     if (!hwnd || !IsWindow(hwnd)) return;
 
@@ -247,11 +260,31 @@ static void ApplyWindowMode(HWND hwnd, UINT bbW, UINT bbH)
 
     SetWindowLongW(hwnd, GWL_STYLE, style);
     SetWindowLongW(hwnd, GWL_EXSTYLE, exStyle);
-    SetWindowPos(hwnd, HWND_NOTOPMOST, x, y, w, h,
-                 SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOACTIVATE);
 
-    Log("[window] hwnd=0x%08X mode=%d pos=%d,%d size=%dx%d (backbuffer %ux%u)",
-        PTRV(hwnd), g_mode, x, y, w, h, bbW, bbH);
+    /* The window MUST end up active, or the game never wakes up.
+     *
+     * An exclusive-fullscreen device activates the window as part of taking the display.
+     * Once it is windowed, nothing does that for us, and BGE treats an inactive window as
+     * "not playing": it stops polling its DirectInput devices and silences audio. The
+     * symptom is a game that starts, draws the menu, and ignores the controller entirely
+     * until you alt-tab away and back - at which point input and sound both arrive.
+     *
+     * SWP_NOACTIVATE was doing exactly the wrong thing here. It is kept only for the
+     * reassert-after-Reset path when the player has alt-tabbed elsewhere, where yanking
+     * focus back would be worse than leaving it. */
+    UINT flags = SWP_FRAMECHANGED | SWP_SHOWWINDOW;
+    if (!activate) flags |= SWP_NOACTIVATE;
+
+    SetWindowPos(hwnd, HWND_NOTOPMOST, x, y, w, h, flags);
+
+    if (activate) {
+        SetForegroundWindow(hwnd);
+        SetActiveWindow(hwnd);   /* no-ops unless we are on the window's thread */
+        SetFocus(hwnd);
+    }
+
+    Log("[window] hwnd=0x%08X mode=%d pos=%d,%d size=%dx%d (backbuffer %ux%u) activate=%d",
+        PTRV(hwnd), g_mode, x, y, w, h, bbW, bbH, activate);
 }
 
 /* ------------------------------------------------------------------ the one edit */
@@ -264,7 +297,8 @@ static void ApplyWindowMode(HWND hwnd, UINT bbW, UINT bbH)
  * calls on device-lost recovery and on any resolution change from an options menu. A
  * proxy that only intercepts CreateDevice goes back to exclusive fullscreen the first
  * time the game resets - which is exactly the state this DLL exists to prevent. */
-static HWND ForceWindowed(D3DPRESENT_PARAMETERS* pp, HWND fallback, const char* where)
+static HWND ForceWindowed(D3DPRESENT_PARAMETERS* pp, HWND fallback, const char* where,
+                          BOOL activate)
 {
     HWND target = fallback;
     if (!pp) return target;
@@ -281,7 +315,7 @@ static HWND ForceWindowed(D3DPRESENT_PARAMETERS* pp, HWND fallback, const char* 
 
     /* In stretch mode the backbuffer stays at the game's resolution and D3D scales it
      * to the client area on Present, so only the window changes. */
-    ApplyWindowMode(target, pp->BackBufferWidth, pp->BackBufferHeight);
+    ApplyWindowMode(target, pp->BackBufferWidth, pp->BackBufferHeight, activate);
     return target;
 }
 
@@ -324,7 +358,12 @@ public:
 
     HRESULT STDMETHODCALLTYPE Reset(D3DPRESENT_PARAMETERS* pp) override
     {
-        HWND target = ForceWindowed(pp, focus_, "reset");
+        /* A reset can happen while the player is in another window - device loss is one
+         * of the ways that shows up. Take focus only if this process already has it,
+         * so a background reset cannot yank the desktop back to the game. */
+        const BOOL activate = OwnsForeground(pp && pp->hDeviceWindow ? pp->hDeviceWindow : focus_);
+
+        HWND target = ForceWindowed(pp, focus_, "reset", activate);
 
         HRESULT hr = real_->Reset(pp);
         Log("[reset] result=0x%08X", hr);
@@ -332,7 +371,7 @@ public:
         /* Reset re-establishes the swap chain, and a driver may resize or restore the
          * window while doing so. Reassert, exactly as after CreateDevice. */
         if (SUCCEEDED(hr) && pp)
-            ApplyWindowMode(target, pp->BackBufferWidth, pp->BackBufferHeight);
+            ApplyWindowMode(target, pp->BackBufferWidth, pp->BackBufferHeight, activate);
 
         return hr;
     }
@@ -732,14 +771,16 @@ public:
                                            DWORD behaviour, D3DPRESENT_PARAMETERS* pp,
                                            IDirect3DDevice9** ppDevice) override
     {
-        HWND target = ForceWindowed(pp, hFocus, "create");
+        /* Device creation is the game starting up: it should end up focused, exactly as
+         * an exclusive-fullscreen device would have left it. */
+        HWND target = ForceWindowed(pp, hFocus, "create", TRUE);
 
         HRESULT hr = real_->CreateDevice(adapter, devType, hFocus, behaviour, pp, ppDevice);
         Log("[create] result=0x%08X", hr);
         if (FAILED(hr)) return hr;
 
         /* Some drivers resize the window during device creation; reassert afterwards. */
-        if (pp) ApplyWindowMode(target, pp->BackBufferWidth, pp->BackBufferHeight);
+        if (pp) ApplyWindowMode(target, pp->BackBufferWidth, pp->BackBufferHeight, TRUE);
 
         if (ppDevice && *ppDevice) {
             void* mem = HeapAlloc(GetProcessHeap(), 0, sizeof(D3D9DeviceProxy));

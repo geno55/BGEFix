@@ -878,6 +878,11 @@ HRESULT WINAPI DirectInput8Create(HINSTANCE hinst, DWORD ver, REFIID riid,
 
     /* IDirectInput8W has the same vtable layout, so the ANSI wrapper serves both. */
     DI8Proxy* w = new (mem) DI8Proxy((IDirectInput8A*)*ppvOut);
+
+    /* Load the XInput runtime now rather than on the first poll. Deferring it puts a
+     * LoadLibrary in the middle of the game's first input frame for no reason. */
+    InitXInput();
+
     Log("[init] wrapped IDirectInput8 0x%08X as 0x%08X", PTRV(*ppvOut), PTRV(w));
     *ppvOut = w;
     return hr;

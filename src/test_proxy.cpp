@@ -102,6 +102,14 @@ int main(void)
     wsprintfA(buf, "client=%dx%d", rc.right, rc.bottom);
     check("client area matches backbuffer", rc.right == 800 && rc.bottom == 600, buf);
 
+    /* An exclusive-fullscreen device activates the window as part of taking the display.
+     * Windowed, nothing does that for us - and BGE treats an inactive window as "not
+     * playing": it stops polling DirectInput and silences audio. The game then ignores
+     * the controller entirely until you alt-tab away and back. */
+    HWND fg = GetForegroundWindow();
+    wsprintfA(buf, "foreground=0x%08X ours=0x%08X", (unsigned)(UINT_PTR)fg, (unsigned)(UINT_PTR)hwnd);
+    check("window is ACTIVE after CreateDevice", fg == hwnd, buf);
+
     /* ---------------------------------------------------------------- Reset --------
      * The other place a D3D9 app sets Windowed. This is what the game does on
      * device-lost recovery and on a resolution change from its options menu. A proxy
