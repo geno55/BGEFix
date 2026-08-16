@@ -153,40 +153,10 @@ powershell -ExecutionPolicy Bypass -File .\Fix-BGE.ps1 -Component Controller
 ```
 
 That installs gamepad support and touches nothing else — no compatibility database is
-removed, no shortcut appears. Previously the only way to get controller support was
-`-InstallControllerSupport`, which ran the entire apply path.
+removed, no shortcut appears.
 
 `-Revert` takes the same list, so `-Revert -Component Controller` removes the gamepad
 proxy and leaves everything else installed.
-
-Selection used to be `-NoShortcut`, `-NoWindowedProxy` and `-InstallControllerSupport` —
-two opt-outs and an opt-in for three co-equal features. **They have been removed**, not
-deprecated: passing one is now a parameter binding error. That is loud and changes
-nothing, where a silent remap of a misread flag would not be.
-
-| Was | Now |
-|---|---|
-| *(default)* | *(unchanged, minus the desktop shortcut)* |
-| `-NoShortcut` | *(now the only behaviour — the launcher is gone)* |
-| `-NoWindowedProxy` | `-Component AltTab` |
-| `-InstallControllerSupport` | `-Component All` |
-| `-AffinityMask <n>` | *(removed with the launcher; the shim pins one core)* |
-| — | `-Component Controller` (new: gamepad only) |
-
-**Contradictions are now binding errors**, not silently-resolved precedence. `-Status`,
-`-Revert` and the install path are separate parameter sets, and apply-only tuning is not
-declared in the others:
-
-```
--Status -Revert            -> Parameter set cannot be resolved
--Revert -WindowMode 2      -> Parameter set cannot be resolved
--Component Controller -WindowMode 2
-                           -> -WindowMode only applies to the Windowed component
-```
-
-The last one is a runtime check: parameter sets cannot express "only meaningful when
-`-Component` includes `Windowed`", and silently ignoring the setting is how people come to
-believe they configured something they did not.
 
 ### Running it unattended
 
@@ -195,8 +165,7 @@ script:
 
 - **The exit code is real.** When the script elevates itself it waits for the elevated
   copy and returns *its* exit code. 0 means the work succeeded; non-zero means it failed
-  or you cancelled the UAC prompt. Earlier versions launched the elevated copy and
-  returned immediately, so the caller always saw success.
+  or you cancelled the UAC prompt.
 - **`-Force` actually runs unattended.** The elevated window closes on its own. Without
   `-Force` it pauses on a keypress instead, so you can read the summary.
 - **Nothing is written to a user profile**, so it does not matter that UAC elevates into a
@@ -228,28 +197,13 @@ It applies that edit at **both** places a D3D9 application sets the field:
 | `IDirect3D9::CreateDevice` | once, at startup |
 | `IDirect3DDevice9::Reset` | device-lost recovery, and any resolution or display change |
 
-Intercepting only `CreateDevice` produces a fix that looks correct at launch and quietly
-expires the first time the game resets — change the resolution in `SettingsApplication.exe`
-or lose the device for any reason, and the game resets with `Windowed = FALSE`, drops back
-into exclusive fullscreen, and the HUD corruption returns mid-session. So the device
-returned by `CreateDevice` is wrapped too, and both paths run the same edit.
-`CreateAdditionalSwapChain` is a third present-parameters entry point and is covered for
-completeness, though D3D9 already requires windowed there.
-
-It exists so this tool has no external dependency. The alternative was pulling a 1.29 MB
-unverifiable binary from an anonymous uploader — behind a Cloudflare check, with no stable
-download URL — in order to set one boolean.
-
 ### Design notes
 
 - **Interfaces come from the Windows SDK.** `d3d9.h` ships under
   `Include\<ver>\shared` (not `um\`, which is where people tend to look and conclude it
   is missing); `dinput.h` and `xinput.h` are under `um\`. The proxies derive from
   `IDirect3D9`, `IDirectInput8A` and `IDirectInputDevice8A`, so the compiler emits the
-  vtables and every slot and signature is checked at build time. Hand-declaring these
-  layouts to skip an `#include` trades a compile error for silent stack corruption —
-  it already cost this project one bug, in `IDirect3D9::GetAdapterMonitor`. The legacy
-  DirectX SDK is still not required.
+  vtables and every slot and signature is checked at build time.
 - **32-bit, always.** `BGE.exe` is a 32-bit process and silently fails to load a 64-bit
   DLL. The build forces `/MACHINE:X86` and the installer re-verifies the PE machine type
   before copying anything.
@@ -264,9 +218,7 @@ download URL — in order to set one boolean.
   does not intercept. That code lives once in
   [`src/proxy_common.h`](src/proxy_common.h); each proxy states only what its files are
   called — ini base name, chain filename, and the system DLL to fall back to. The shared
-  keys are read from `[General]` in both. It was previously pasted into both `.cpp`
-  files, where the copies had already begun to drift — including reading `Log` and
-  `Chain` from a different ini section in each.
+  keys are read from `[General]` in both.
 - **The window must end up active.** An exclusive-fullscreen device activates the window
   as part of taking the display; a windowed one does not, and BGE reads an inactive
   window as "not playing" — it stops polling DirectInput and silences audio, so the game
@@ -390,10 +342,7 @@ format, two things follow from that single fact:
   re-run settings application").
 
 None of that is caused by this tool — it reproduces with every file here removed, on a
-copy of `SettingsApplication.exe` alone in an empty folder. On the machine this was
-diagnosed on (Radeon 780M + RTX 4060 hybrid laptop) the runtime's answer is not even
-stable: the same probe binary, run twice seconds apart, reported 119 modes and then 0,
-which is why the same install works one launch and not the next.
+copy of `SettingsApplication.exe` alone in an empty folder.
 
 So `Fill16BitModeList=1` stands the 32-bit list in when the driver reports no 16-bit one:
 same resolutions, same refresh rates, same order, relabelled — so a mode index the
@@ -477,30 +426,18 @@ and look has to mean the same thing at any frame rate. Three rules do that:
   fractional remainder carries between calls, so a stick held just off centre moves the
   camera slowly instead of truncating to zero.
 - **Finding the pad is throttled.** `XInputGetState` on an empty slot is a documented
-  slow path that Microsoft says not to call every frame. Walking indices 0–3 until one
-  answered did exactly that, from both wrapped devices — about **1150 slow calls a
-  second** at 144 Hz on a machine with no controller, which is most machines running an
-  Alt+Tab fix, in a game pinned to one core for timing stability. The connected index is
-  now remembered, so a poll costs one call; all four slots are only swept when nothing is
+  slow path that Microsoft says not to call every frame. The connected index is
+  remembered, so a poll costs one call; all four slots are only swept when nothing is
   connected *or* the current pad is idle, and then at most every two seconds. Scanning
-  while idle is what lets you put down pad 0 and pick up pad 1 — previously the loop
-  stopped at the first slot that answered, so a connected-but-untouched pad 0 meant pad 1
-  was never read at all.
+  while idle is what lets you put down pad 0 and pick up pad 1.
 - **The deadzone is radial and rescaled.** Thresholding each axis separately leaves a
   cross-shaped dead region — at `Deadzone=8000` a diagonal push of `(8000, 8000)` failed
   both axis tests despite being 11313 units out, so diagonals needed a harder push than
   cardinals. It also stepped: output jumped from 0 straight to the raw axis value on
   crossing. Now the test is on vector length and `[deadzone, full]` is remapped onto
   `[0, 1]`, so the dead region is a disc and the response ramps from zero.
-- **Injected events are numbered in DirectInput's namespace.** In buffered mode the
-  synthetic events go into the same buffer as DirectInput's own, and applications compare
-  `dwSequence` with `DISEQUENCE_COMPARE` to order events across devices. A private counter
-  starting at 1 — the previous behaviour — is not in that namespace at all: every
-  injected event sorted before every real one, forever. There is no API to read
-  DirectInput's counter, so the proxy anchors instead, tracking the highest real sequence
-  number seen on either wrapped device and issuing synthetic events just above it.
 
-The maths lives in [`src/pad_support.h`](src/pad_support.h), which the proxy and the test
+The math lives in [`src/pad_support.h`](src/pad_support.h), which the proxy and the test
 suite both compile, so it is asserted on numerically with no controller attached:
 
 ```
@@ -530,11 +467,6 @@ cross-device ordering under `DISEQUENCE_COMPARE` should not assume this DLL is
 transparent. It is a BGE shim that behaves itself toward other clients, not a
 general-purpose `dinput8` replacement.
 
-**Upgrading:** `LookSensitivity` was counts per poll and has been replaced by `LookSpeed`
-in counts per second. An older `.ini` still carrying `LookSensitivity` is not converted —
-the key is ignored and `LookSpeed` falls back to its default. Run with `-ResetConfig` to
-regenerate the file, or add a `LookSpeed` line yourself.
-
 ---
 
 ## What it changes
@@ -549,14 +481,6 @@ regenerate the file, or add a `LookSpeed` line yourself.
 
 The original `goggame.sdb` also remains untouched in the game folder, so the change is
 reversible even if the backup directory is deleted.
-
-### Upgrading from an older version
-
-The state directory was renamed and the desktop launcher removed, and **nothing is
-migrated**. If you applied the fix with an older build, revert with *that* build first.
-Otherwise the old `%ProgramData%\BGEAltTabFix\` and any
-`Beyond Good & Evil (Alt+Tab Fix).lnk` are stranded: this version does not know about them,
-`-Revert` will not touch them, and deleting them is a manual job.
 
 ## Important limitations
 
@@ -599,13 +523,6 @@ The marker is `BGEFIX_PROXY{502eb6b9-…}v2`. The GUID is the identity and never
 the trailing number is a version, and the installer **matches the prefix and parses the
 number** rather than comparing the whole string.
 
-That distinction is the entire point. An installer that looked for the exact marker it
-ships would meet the *previous* release's DLL, fail to recognise it, classify it as a
-third-party wrapper, rename it to `d3d9_chain.dll` and chain new-to-old — which is
-precisely the failure the marker was introduced to prevent, arriving one release later on
-schedule. Older markers are listed and still recognised; newer ones parse fine and are
-replaced with a warning rather than chained to.
-
 This answer is also the authority for overwriting a file in the game folder **without
 backing it up**, so it is more than a substring search. The file must be a 32-bit PE, and
 the version digits must be followed by a NUL, since the marker is a C string literal. That
@@ -633,12 +550,6 @@ it, so the tool reads it — it walks the `.sdb` tag tree through `apphelp.dll`,
 parser Windows itself uses, and reports every executable the database patches and every
 modification it applies to each.
 
-It did not always. The previous implementation searched the raw bytes for the two shim
-names the script already hardcodes, which made it structurally incapable of returning a
-third: if GOG reissued the database with an extra shim, the tool would report the same two,
-remove the database, and drop the third silently — while `-Status` printed the list as
-though it were an inventory of the file.
-
 Consequences of reading it for real:
 
 - `-Status` lists what the database actually contains, and marks anything this tool does
@@ -647,14 +558,13 @@ Consequences of reading it for real:
   beyond the two known shims, naming what removal would drop.
 - **A database that cannot be parsed is treated as unknown, not as empty**, and the tool
   refuses to remove it. "No shims found" and "could not read the file" are different
-  answers and are no longer conflated.
+  answers and are not conflated.
 - **Only databases that actually apply `IgnoreAltTab` are removed.** If a database is
   registered for `BGE.exe` that the script cannot identify, it refuses to touch it rather
-  than guessing, and now says what it found instead.
+  than guessing, and says what it found instead.
 
 [`src/test_installer.ps1`](src/test_installer.ps1) builds real `.sdb` files carrying shims
-the tool has never heard of, which is the case the old implementation could not even
-represent:
+the tool has never heard of:
 
 ```
 PASS an UNHARDCODED third shim is discovered -> shims: IgnoreAltTab, SingleProcAffinity, SomeFutureShim
@@ -676,26 +586,6 @@ Deriving from the copy already on the user's disk avoids redistributing it, keep
 of those fields byte-identical so the shim still matches, and keeps working if GOG reissues
 the database. It also means the tool preserves any *other* shim the database applies —
 only `IgnoreAltTab` is removed, rather than a hardcoded set being reimposed.
-
-## The launcher shortcut, and why it is gone
-
-Earlier versions replaced `SingleProcAffinity` with a desktop shortcut using
-`start /affinity`, and described rebuilding the database as a "purist alternative" needing
-the [Windows ADK](https://learn.microsoft.com/en-us/windows-hardware/get-started/adk-install)'s
-Compatibility Administrator.
-
-Both halves of that were wrong. The shortcut was a downgrade dressed up as a replacement:
-a shim the OS applied unconditionally became something you had to remember to click, and
-`-NoShortcut` silently meant "no affinity at all". And the ADK was never required —
-Compatibility Administrator *authors* an `.sdb`, it is not needed to *edit* one.
-
-Once the replacement database landed, the shortcut had nothing left to do. It survived
-briefly as a "convenience" that duplicated GOG's own desktop icon, and as a fallback for a
-failed database install — but falling back to it would have meant reporting success while
-delivering something weaker than what GOG shipped. It is now removed entirely, along with
-`-AffinityMask`, `New-AffinityShortcut`, and the machinery for resolving the invoking
-user's desktop across a UAC elevation. That last item was a genuine source of bugs and
-existed solely to place this one file.
 
 ## Credits
 
