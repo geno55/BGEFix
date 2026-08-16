@@ -71,6 +71,12 @@
  * already present, rename it to dinput8_chain.dll and we forward to it; otherwise we load
  * the system copy. A 32-bit process gets SysWOW64 via file system redirection.
  *
+ * That loading, the ini and log paths, the installer marker and the DllMain dance are the
+ * same code the d3d9 proxy needs, so they live in proxy_common.h and only the three file
+ * names in kProxyConfig below differ; the keys that header owns are read from [General]
+ * here exactly as they are there. Anything added here that is not about DirectInput or
+ * the pad probably belongs in that header instead.
+ *
  * License: MIT.
  */
 
@@ -79,17 +85,9 @@
 #include <windows.h>
 #include <dinput.h>
 #include <xinput.h>
-#include <stdarg.h>
-#include "pad_support.h"
 #include <new>
-
-#define PTRV(p) ((unsigned)(UINT_PTR)(p))
-
-/* Lets the installer recognise this DLL as one of ours across rebuilds. The GUID is the
- * identity, the trailing number is a version the installer parses rather than compares.
- * See the fuller note in d3d9_windowed.cpp. Referenced from DllMain so it is not
- * optimised out. */
-static const char kProxyMarker[] = "BGEFIX_PROXY{502eb6b9-f979-4627-b242-8e146e0fc1de}v2";
+#include "pad_support.h"
+#include "proxy_common.h"
 
 /* A mapping target: 0 = unmapped, MOUSE_BASE+n = mouse button n, else a DIK scan code. */
 #define MOUSE_BASE 0x1000
@@ -101,18 +99,21 @@ typedef DWORD (WINAPI *PFN_XInputGetState)(DWORD, XINPUT_STATE*);
 
 /* ------------------------------------------------------------------ state */
 
-static HMODULE g_self = NULL, g_chain = NULL, g_xinput = NULL;
+static const ProxyConfig kProxyConfig = {
+    L"dinput8_xinput",      /* dinput8_xinput.ini / dinput8_xinput.log */
+    L"dinput8_chain.dll",   /* a third-party dinput8 wrapper the installer renamed */
+    L"dinput8.dll"          /* the real implementation, under System32 (SysWOW64 for us) */
+};
+
+static HMODULE g_xinput = NULL;
 static PFN_XInputGetState g_XInputGetState = NULL;
 
-/* Two locks, each with one job. g_modLock covers lazy module loading (the chain DLL and
- * the XInput runtime); g_padLock covers the pad sample and the settings it is built
- * from. Lock order is pad -> module; nothing ever takes them the other way round. */
-static CRITICAL_SECTION g_modLock;
+/* Two locks, each with one job. The module lock in proxy_common.h covers lazy module
+ * loading (the chain DLL and the XInput runtime); g_padLock covers the pad sample and the
+ * settings it is built from. Lock order is pad -> module; nothing ever takes them the
+ * other way round. */
 static CRITICAL_SECTION g_padLock;
-static BOOL g_locksReady = FALSE;
-
-static BOOL g_log = FALSE;
-static wchar_t g_ini[MAX_PATH] = {0}, g_logPath[MAX_PATH] = {0};
+static BOOL g_padLockReady = FALSE;
 
 /* Settings. Written by LoadConfig and read by RebuildSample, both under g_padLock. */
 static int  g_mA, g_mB, g_mX, g_mY, g_mLB, g_mRB, g_mLT, g_mRT;
@@ -185,26 +186,6 @@ static double SecondsSince(LONGLONG then, LONGLONG now)
     return (double)(now - then) / (double)g_qpcFreq;
 }
 
-/* ------------------------------------------------------------------ logging */
-
-static void Log(const char* fmt, ...)
-{
-    if (!g_log || !g_logPath[0]) return;
-    char buf[1024];
-    va_list ap; va_start(ap, fmt);
-    int n = wvsprintfA(buf, fmt, ap);
-    va_end(ap);
-    if (n < 0) return;
-    HANDLE h = CreateFileW(g_logPath, FILE_APPEND_DATA, FILE_SHARE_READ, NULL,
-                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) return;
-    DWORD w = 0;
-    SetFilePointer(h, 0, NULL, FILE_END);
-    WriteFile(h, buf, (DWORD)n, &w, NULL);
-    WriteFile(h, "\r\n", 2, &w, NULL);
-    CloseHandle(h);
-}
-
 /* ------------------------------------------------------------------ config */
 
 static int ParseTarget(const wchar_t* s, int fallback)
@@ -236,26 +217,15 @@ static int ParseTarget(const wchar_t* s, int fallback)
 static int ReadMap(const wchar_t* key, const wchar_t* def)
 {
     wchar_t buf[64];
-    GetPrivateProfileStringW(L"Buttons", key, def, buf, 64, g_ini);
+    GetPrivateProfileStringW(L"Buttons", key, def, buf, 64, g_iniPath);
     return ParseTarget(buf, 0);
 }
 
 static int ReadStick(const wchar_t* key, const wchar_t* def)
 {
     wchar_t buf[64];
-    GetPrivateProfileStringW(L"Sticks", key, def, buf, 64, g_ini);
+    GetPrivateProfileStringW(L"Sticks", key, def, buf, 64, g_iniPath);
     return ParseTarget(buf, 0);
-}
-
-static void BuildPaths(void)
-{
-    wchar_t p[MAX_PATH];
-    DWORD len = GetModuleFileNameW(g_self, p, MAX_PATH);
-    if (!len || len >= MAX_PATH) return;
-    for (DWORD i = len; i > 0; --i)
-        if (p[i-1] == L'\\' || p[i-1] == L'/') { p[i] = 0; break; }
-    lstrcpynW(g_ini, p, MAX_PATH);     lstrcatW(g_ini, L"dinput8_xinput.ini");
-    lstrcpynW(g_logPath, p, MAX_PATH); lstrcatW(g_logPath, L"dinput8_xinput.log");
 }
 
 static int ClampInt(int v, int lo, int hi)
@@ -268,8 +238,8 @@ static int ClampInt(int v, int lo, int hi)
 /* Takes g_padLock: these values are read while building a sample. */
 static void LoadConfig(void)
 {
-    if (!g_ini[0]) return;
-    if (g_locksReady) EnterCriticalSection(&g_padLock);
+    if (!g_iniPath[0]) return;
+    if (g_padLockReady) EnterCriticalSection(&g_padLock);
 
     /* Defaults follow the game's own bindings, decoded from
      * HKCU\Software\Ubisoft\Beyond Good & Evil\...\Key bindings. */
@@ -299,12 +269,12 @@ static void LoadConfig(void)
      * rather than numbers picked here. Clamped so a hand-edited ini cannot reach the
      * deadzone == full-scale division in ApplyDeadzone. */
     g_deadzone     = ClampInt((int)GetPrivateProfileIntW(L"Sticks", L"Deadzone",
-                              XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE, g_ini), 0, 32000);
+                              XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE, g_iniPath), 0, 32000);
     g_lookDeadzone = ClampInt((int)GetPrivateProfileIntW(L"Sticks", L"LookDeadzone",
-                              XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE, g_ini), 0, 32000);
+                              XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE, g_iniPath), 0, 32000);
     g_triggerThreshold = ClampInt((int)GetPrivateProfileIntW(L"Buttons", L"TriggerThreshold",
-                              XINPUT_GAMEPAD_TRIGGER_THRESHOLD, g_ini), 0, 254);
-    g_invertLook   = (int)GetPrivateProfileIntW(L"Sticks", L"InvertLook", 0, g_ini);
+                              XINPUT_GAMEPAD_TRIGGER_THRESHOLD, g_iniPath), 0, 254);
+    g_invertLook   = (int)GetPrivateProfileIntW(L"Sticks", L"InvertLook", 0, g_iniPath);
 
     /* LookSpeed is mouse counts per second at full stick deflection - a real unit, the
      * same on every machine. It replaces LookSensitivity, which was counts per *poll*:
@@ -312,59 +282,23 @@ static void LoadConfig(void)
      * at 144 Hz than at 60 Hz and the documented "30" meant nothing on its own. An
      * ini still carrying the old key just gets the default. */
     g_lookSpeed = ClampInt((int)GetPrivateProfileIntW(L"Sticks", L"LookSpeed",
-                           1800, g_ini), 1, 20000);
+                           1800, g_iniPath), 1, 20000);
 
-    g_log = GetPrivateProfileIntW(L"General", L"Log", 0, g_ini) != 0;
+    ProxyLoadCommonConfig();   /* [General] Log */
 
-    if (g_locksReady) LeaveCriticalSection(&g_padLock);
+    if (g_padLockReady) LeaveCriticalSection(&g_padLock);
 }
 
-/* ------------------------------------------------------------------ chain */
+/* ------------------------------------------------------------------ xinput runtime */
 
-static HMODULE GetChain(void)
-{
-    if (g_chain) return g_chain;
-    if (!g_locksReady) return NULL;
-
-    EnterCriticalSection(&g_modLock);
-    if (!g_chain) {
-        wchar_t self[MAX_PATH], dir[MAX_PATH], cand[MAX_PATH], name[64];
-        DWORD len = GetModuleFileNameW(g_self, self, MAX_PATH);
-        lstrcpynW(dir, self, MAX_PATH);
-        for (DWORD i = len; i > 0; --i)
-            if (dir[i-1] == L'\\' || dir[i-1] == L'/') { dir[i] = 0; break; }
-
-        GetPrivateProfileStringW(L"General", L"Chain", L"dinput8_chain.dll", name, 64, g_ini);
-        lstrcpynW(cand, dir, MAX_PATH); lstrcatW(cand, name);
-        if (lstrcmpiW(cand, self) != 0 && GetFileAttributesW(cand) != INVALID_FILE_ATTRIBUTES) {
-            g_chain = LoadLibraryW(cand);
-            Log("[chain] %S -> 0x%08X", cand, PTRV(g_chain));
-        }
-        if (!g_chain) {
-            /* A 32-bit process is redirected to SysWOW64, which is what we want. */
-            UINT n = GetSystemDirectoryW(cand, MAX_PATH);
-            if (n > 0 && n < MAX_PATH) {
-                lstrcatW(cand, L"\\dinput8.dll");
-                if (lstrcmpiW(cand, self) != 0) {
-                    g_chain = LoadLibraryW(cand);
-                    Log("[chain] %S -> 0x%08X", cand, PTRV(g_chain));
-                }
-            }
-        }
-    }
-    LeaveCriticalSection(&g_modLock);
-    return g_chain;
-}
-
-/* Module loading, so it belongs to g_modLock rather than g_padLock. Callers may already
- * hold g_padLock; that ordering is fine and never reversed. */
+/* Module loading, so it belongs to the module lock rather than g_padLock. Callers may
+ * already hold g_padLock; that ordering is fine and never reversed. */
 static void InitXInput(void)
 {
     if (g_XInputGetState) return;
-    if (!g_locksReady) return;
+    if (!ProxyEnterModuleLock()) return;
 
-    EnterCriticalSection(&g_modLock);
-    if (!g_XInputGetState) {
+    if (!g_XInputGetState) {   /* another thread may have loaded it while we waited */
         const wchar_t* names[] = { L"xinput1_4.dll", L"xinput1_3.dll", L"xinput9_1_0.dll" };
         for (int i = 0; i < 3; ++i) {
             g_xinput = LoadLibraryW(names[i]);
@@ -376,7 +310,7 @@ static void InitXInput(void)
         }
         if (!g_XInputGetState) Log("[xinput] no XInput runtime found");
     }
-    LeaveCriticalSection(&g_modLock);
+    ProxyLeaveModuleLock();
 }
 
 /* ------------------------------------------------------------------ sampling */
@@ -546,7 +480,7 @@ static void RebuildSample(LONGLONG now)
 static void SamplePad(PadSample* out)
 {
     memset(out, 0, sizeof(*out));
-    if (!g_locksReady) return;
+    if (!g_padLockReady) return;
 
     EnterCriticalSection(&g_padLock);
 
@@ -660,7 +594,7 @@ public:
 
         /* One acquisition for the whole batch. The sequence anchor is shared with the
          * other wrapped device because DirectInput's numbering is process-wide. */
-        if (g_locksReady) EnterCriticalSection(&g_padLock);
+        if (g_padLockReady) EnterCriticalSection(&g_padLock);
 
         /* Read DirectInput's numbering off the events it just returned, then issue ours
          * from just above it, so both sets compare correctly under DISEQUENCE_COMPARE. */
@@ -679,7 +613,7 @@ public:
             used++;
         }
 
-        if (g_locksReady) LeaveCriticalSection(&g_padLock);
+        if (g_padLockReady) LeaveCriticalSection(&g_padLock);
 
         if (!peek) memcpy(prev_, cur, (size_t)n);
         *pdwInOut = used;
@@ -866,8 +800,7 @@ HRESULT WINAPI DirectInput8Create(HINSTANCE hinst, DWORD ver, REFIID riid,
 {
     LoadConfig();
 
-    HMODULE m = GetChain();
-    PFN_DI8Create fn = m ? (PFN_DI8Create)GetProcAddress(m, "DirectInput8Create") : NULL;
+    PFN_DI8Create fn = (PFN_DI8Create)ChainProc("DirectInput8Create");
     if (!fn) { Log("[init] cannot resolve DirectInput8Create"); return E_FAIL; }
 
     HRESULT hr = fn(hinst, ver, riid, ppvOut, punkOuter);
@@ -891,35 +824,35 @@ HRESULT WINAPI DirectInput8Create(HINSTANCE hinst, DWORD ver, REFIID riid,
 HRESULT WINAPI DllCanUnloadNow(void)
 {
     typedef HRESULT (WINAPI *PFN)(void);
-    PFN fn = (PFN)(GetChain() ? GetProcAddress(GetChain(), "DllCanUnloadNow") : NULL);
+    PFN fn = (PFN)ChainProc("DllCanUnloadNow");
     return fn ? fn() : S_FALSE;
 }
 
 HRESULT WINAPI DllGetClassObject(REFCLSID a, REFIID b, LPVOID* c)
 {
     typedef HRESULT (WINAPI *PFN)(REFCLSID, REFIID, LPVOID*);
-    PFN fn = (PFN)(GetChain() ? GetProcAddress(GetChain(), "DllGetClassObject") : NULL);
+    PFN fn = (PFN)ChainProc("DllGetClassObject");
     return fn ? fn(a, b, c) : E_NOTIMPL;
 }
 
 HRESULT WINAPI DllRegisterServer(void)
 {
     typedef HRESULT (WINAPI *PFN)(void);
-    PFN fn = (PFN)(GetChain() ? GetProcAddress(GetChain(), "DllRegisterServer") : NULL);
+    PFN fn = (PFN)ChainProc("DllRegisterServer");
     return fn ? fn() : E_NOTIMPL;
 }
 
 HRESULT WINAPI DllUnregisterServer(void)
 {
     typedef HRESULT (WINAPI *PFN)(void);
-    PFN fn = (PFN)(GetChain() ? GetProcAddress(GetChain(), "DllUnregisterServer") : NULL);
+    PFN fn = (PFN)ChainProc("DllUnregisterServer");
     return fn ? fn() : E_NOTIMPL;
 }
 
 LPCDIDATAFORMAT WINAPI GetdfDIJoystick(void)
 {
     typedef LPCDIDATAFORMAT (WINAPI *PFN)(void);
-    PFN fn = (PFN)(GetChain() ? GetProcAddress(GetChain(), "GetdfDIJoystick") : NULL);
+    PFN fn = (PFN)ChainProc("GetdfDIJoystick");
     return fn ? fn() : NULL;
 }
 
@@ -928,28 +861,24 @@ LPCDIDATAFORMAT WINAPI GetdfDIJoystick(void)
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 {
     if (reason == DLL_PROCESS_ATTACH) {
-        if (kProxyMarker[0] == 0) return FALSE;   /* keeps the marker in the binary */
-        g_self = (HMODULE)inst;
-        DisableThreadLibraryCalls(inst);
+        if (!ProxyStartup(inst, &kProxyConfig)) return FALSE;
 
         LARGE_INTEGER f;
         g_qpcFreq = QueryPerformanceFrequency(&f) ? f.QuadPart : 0;
 
-        InitializeCriticalSection(&g_modLock);
         InitializeCriticalSection(&g_padLock);
-        g_locksReady = TRUE;
+        g_padLockReady = TRUE;
 
         memset(&g_pad, 0, sizeof(g_pad));
-        BuildPaths();
         LoadConfig();
         /* No LoadLibrary here - the loader lock would deadlock. See GetChain(). */
     }
     else if (reason == DLL_PROCESS_DETACH && reserved == NULL) {
-        if (g_locksReady) {
-            g_locksReady = FALSE;
+        if (g_padLockReady) {
+            g_padLockReady = FALSE;
             DeleteCriticalSection(&g_padLock);
-            DeleteCriticalSection(&g_modLock);
         }
+        ProxyShutdown();
     }
     return TRUE;
 }

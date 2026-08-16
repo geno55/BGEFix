@@ -254,6 +254,15 @@ download URL — in order to set one boolean.
   forwards to it; otherwise it falls back to `System32\d3d9.dll`. Ordering is
   game → proxy → chained DLL → system, so a chained DLL sees the modified parameters and
   could override them.
+- **One copy of the plumbing.** The two DLLs intercept different APIs but are the same
+  kind of thing: a file in the game folder wearing a system DLL's name, reading an ini
+  and writing a log beside itself, carrying the installer marker, and forwarding what it
+  does not intercept. That code lives once in
+  [`src/proxy_common.h`](src/proxy_common.h); each proxy states only what its files are
+  called — ini base name, chain filename, and the system DLL to fall back to. The shared
+  keys are read from `[General]` in both. It was previously pasted into both `.cpp`
+  files, where the copies had already begun to drift — including reading `Log` and
+  `Chain` from a different ini section in each.
 - **No `LoadLibrary` in `DllMain`.** The chain is resolved lazily on first export use;
   loading inside the loader lock would deadlock.
 - **`CheckDeviceType` is answered for the windowed case**, because the game probes device
@@ -312,9 +321,16 @@ src\build_test.cmd 15
 ```ini
 [Display]
 Mode=1     ; 0 = windowed, 1 = borderless centred, 2 = borderless stretched
+
+[General]
 Log=0      ; 1 writes d3d9_windowed.log next to the DLL
 Chain=d3d9_chain.dll
 ```
+
+`[General]` means the same thing in both proxies' ini files: `Log` and `Chain` are read
+from it by `d3d9.dll` and `dinput8.dll` alike, so knowing one file tells you where to look
+in the other. Settings specific to a proxy live in a section named for what they do —
+`[Display]` here, `[Buttons]` and `[Sticks]` for the controller.
 
 Mode 1 preserves the game's aspect ratio, sizing the window to whatever resolution
 `SettingsApplication.exe` is set to. Mode 2 fills the monitor but will distort 4:3 content

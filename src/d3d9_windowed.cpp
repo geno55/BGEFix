@@ -53,143 +53,41 @@
  * Note on ordering: this proxy is outermost (game -> us -> chained DLL -> system), so a
  * chained DLL sees our modified parameters and could override Windowed back to FALSE.
  *
+ * The chain loading itself, the ini and log paths, the installer marker and the DllMain
+ * dance are identical in dinput8_xinput.cpp and live in proxy_common.h. Only the three
+ * file names in kProxyConfig below differ; the keys that header owns are read from
+ * [General] here exactly as they are there. Anything added here that is not about
+ * Direct3D probably belongs in that header instead.
+ *
  * License: MIT.
  */
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d9.h>
-#include <stdarg.h>
 #include <new>
-
-/* wvsprintf supports only c C d i s S u x X - no %p and no %f. Pointers are logged
- * through this cast, which is exact because the DLL is 32-bit by construction. */
-#define PTRV(p) ((unsigned)(UINT_PTR)(p))
-
-/* Lets the installer recognise this DLL as one of ours across rebuilds. Identifying it
- * by file hash instead would make an upgraded build look third-party, and the installer
- * would chain the new proxy to the old one.
- *
- * The GUID is the identity and never changes. The trailing number is a version, and the
- * installer matches the prefix and PARSES it rather than comparing the whole string - if
- * it compared, then bumping this number would make the next installer treat this build as
- * a third-party wrapper and chain to it, which is the very thing the marker prevents.
- *
- * Referenced from DllMain so it is not optimised out of the binary. */
-static const char kProxyMarker[] = "BGEFIX_PROXY{502eb6b9-f979-4627-b242-8e146e0fc1de}v2";
+#include "proxy_common.h"
 
 /* ------------------------------------------------------------------ state */
 
 enum { MODE_WINDOWED = 0, MODE_BORDERLESS = 1, MODE_STRETCH = 2 };
 
-static HMODULE  g_self  = NULL;
-static HMODULE  g_chain = NULL;
-static CRITICAL_SECTION g_lock;
-static BOOL     g_lockReady = FALSE;
-static int      g_mode  = MODE_BORDERLESS;
-static BOOL     g_log   = FALSE;
-static wchar_t  g_iniPath[MAX_PATH]  = {0};
-static wchar_t  g_logPath[MAX_PATH]  = {0};
+static const ProxyConfig kProxyConfig = {
+    L"d3d9_windowed",     /* d3d9_windowed.ini / d3d9_windowed.log */
+    L"d3d9_chain.dll",    /* a third-party d3d9 wrapper the installer renamed */
+    L"d3d9.dll"           /* the real implementation, under System32 */
+};
 
-/* ------------------------------------------------------------------ logging */
-
-static void Log(const char* fmt, ...)
-{
-    if (!g_log || !g_logPath[0]) return;
-
-    char buf[1024];
-    va_list ap;
-    va_start(ap, fmt);
-    int n = wvsprintfA(buf, fmt, ap);
-    va_end(ap);
-    if (n < 0) return;
-
-    HANDLE h = CreateFileW(g_logPath, FILE_APPEND_DATA, FILE_SHARE_READ, NULL,
-                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) return;
-    DWORD written = 0;
-    SetFilePointer(h, 0, NULL, FILE_END);
-    WriteFile(h, buf, (DWORD)n, &written, NULL);
-    WriteFile(h, "\r\n", 2, &written, NULL);
-    CloseHandle(h);
-}
+static int g_mode = MODE_BORDERLESS;
 
 /* ------------------------------------------------------------------ config */
-
-static void BuildPaths(void)
-{
-    wchar_t path[MAX_PATH];
-    DWORD len = GetModuleFileNameW(g_self, path, MAX_PATH);
-    if (len == 0 || len >= MAX_PATH) return;
-
-    /* strip to directory */
-    for (DWORD i = len; i > 0; --i) {
-        if (path[i - 1] == L'\\' || path[i - 1] == L'/') { path[i] = 0; break; }
-    }
-    lstrcpynW(g_iniPath, path, MAX_PATH);
-    lstrcatW(g_iniPath, L"d3d9_windowed.ini");
-    lstrcpynW(g_logPath, path, MAX_PATH);
-    lstrcatW(g_logPath, L"d3d9_windowed.log");
-}
 
 static void LoadConfig(void)
 {
     if (!g_iniPath[0]) return;
     g_mode = (int)GetPrivateProfileIntW(L"Display", L"Mode", MODE_BORDERLESS, g_iniPath);
     if (g_mode < MODE_WINDOWED || g_mode > MODE_STRETCH) g_mode = MODE_BORDERLESS;
-    g_log  = GetPrivateProfileIntW(L"Display", L"Log", 0, g_iniPath) != 0;
-}
-
-/* ------------------------------------------------------------------ chain loading */
-
-/* Never call LoadLibrary from DllMain - this runs lazily on first export use. */
-static HMODULE GetChain(void)
-{
-    if (g_chain) return g_chain;
-    if (!g_lockReady) return NULL;
-
-    EnterCriticalSection(&g_lock);
-    if (!g_chain) {
-        wchar_t self[MAX_PATH], dir[MAX_PATH], cand[MAX_PATH], name[64];
-
-        DWORD len = GetModuleFileNameW(g_self, self, MAX_PATH);
-        lstrcpynW(dir, self, MAX_PATH);
-        for (DWORD i = len; i > 0; --i) {
-            if (dir[i - 1] == L'\\' || dir[i - 1] == L'/') { dir[i] = 0; break; }
-        }
-
-        GetPrivateProfileStringW(L"Display", L"Chain", L"d3d9_chain.dll",
-                                 name, 64, g_iniPath);
-
-        /* 1. chain target beside us (a renamed DXVK, dgVoodoo, ReShade, ...) */
-        lstrcpynW(cand, dir, MAX_PATH);
-        lstrcatW(cand, name);
-        if (lstrcmpiW(cand, self) != 0 &&
-            GetFileAttributesW(cand) != INVALID_FILE_ATTRIBUTES) {
-            g_chain = LoadLibraryW(cand);
-            Log("[chain] loaded %S -> 0x%08X", cand, PTRV(g_chain));
-        }
-
-        /* 2. the real system implementation */
-        if (!g_chain) {
-            UINT n = GetSystemDirectoryW(cand, MAX_PATH);
-            if (n > 0 && n < MAX_PATH) {
-                lstrcatW(cand, L"\\d3d9.dll");
-                if (lstrcmpiW(cand, self) != 0) {
-                    g_chain = LoadLibraryW(cand);
-                    Log("[chain] loaded %S -> 0x%08X", cand, PTRV(g_chain));
-                }
-            }
-        }
-    }
-    LeaveCriticalSection(&g_lock);
-    return g_chain;
-}
-
-static FARPROC ChainProc(const char* name)
-{
-    HMODULE m = GetChain();
-    return m ? GetProcAddress(m, name) : NULL;
+    ProxyLoadCommonConfig();   /* [General] Log */
 }
 
 /* ------------------------------------------------------------------ window restyle */
@@ -902,17 +800,12 @@ DWORD WINAPI D3DPERF_GetStatus(void)
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 {
     if (reason == DLL_PROCESS_ATTACH) {
-        if (kProxyMarker[0] == 0) return FALSE;   /* keeps the marker in the binary */
-        g_self = (HMODULE)inst;
-        DisableThreadLibraryCalls(inst);
-        InitializeCriticalSection(&g_lock);
-        g_lockReady = TRUE;
-        BuildPaths();
+        if (!ProxyStartup(inst, &kProxyConfig)) return FALSE;
         LoadConfig();
         /* No LoadLibrary here - that would deadlock the loader. See GetChain(). */
     }
     else if (reason == DLL_PROCESS_DETACH && reserved == NULL) {
-        if (g_lockReady) { DeleteCriticalSection(&g_lock); g_lockReady = FALSE; }
+        ProxyShutdown();
     }
     return TRUE;
 }

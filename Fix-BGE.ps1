@@ -1184,6 +1184,10 @@ function Install-WindowedProxy {
                 '; Mode 0 = windowed   1 = borderless centred (default)   2 = borderless stretched',
                 '[Display]',
                 "Mode=$WindowMode",
+                '',
+                # Log and Chain live in [General] in every proxy ini this installer writes,
+                # so one file teaches you where to find them in the other.
+                '[General]',
                 'Log=0',
                 'Chain=d3d9_chain.dll'
             )
