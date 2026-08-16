@@ -8,6 +8,8 @@
 # test binaries and proxy runtime output
 dist/test_proxy.exe
 dist/test_dinput.exe
+# forced-out-of-memory proxy copies, built by build_test.cmd to walk the failure paths
+dist/oom/
 dist/d3d9_windowed.log
 dist/d3d9_windowed.ini
 dist/dinput8_xinput.log

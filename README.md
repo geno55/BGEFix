@@ -263,6 +263,14 @@ download URL — in order to set one boolean.
   keys are read from `[General]` in both. It was previously pasted into both `.cpp`
   files, where the copies had already begun to drift — including reading `Log` and
   `Chain` from a different ini section in each.
+- **A degraded proxy says so.** If a wrapper cannot be allocated, or no XInput runtime is
+  present, the DLL hands the real interface through so the game keeps running — but that
+  is a behaviour change the player would otherwise have no way to see, and for the d3d9
+  proxy it means silently returning to the exclusive fullscreen the fix exists to
+  prevent. Every such site reports through `ProxyDegraded`, which writes to the log *even
+  with `Log=0`* (the default — a warning only visible to someone who already enabled
+  logging reaches nobody) and shows one message box per process naming what was lost.
+  `BGEFIX_NO_UI=1` in the environment suppresses the box; the log line still goes out.
 - **No `LoadLibrary` in `DllMain`.** The chain is resolved lazily on first export use;
   loading inside the loader lock would deadlock.
 - **`CheckDeviceType` is answered for the windowed case**, because the game probes device
@@ -306,6 +314,17 @@ SKIP XInput pad connected on port 0 -> none detected, injection not exercised
 
 A controller is not required to run the suite. When none is attached that last line reads
 `SKIP` and the run still passes — everything above it exercises the proxy itself.
+
+`build_test.cmd` also builds a second, throwaway pair of DLLs with `BGEFIX_TEST_OOM`
+defined, in which wrapper allocations fail on demand, and runs the tests against them:
+
+```
+PASS the game still gets a usable IDirect3D9   PASS this session is still windowed
+PASS the game still gets a working device      PASS the failure is logged even with Log=0
+```
+
+Those branches decide what the game does when the fix cannot be applied, and no ordinary
+run ever reaches them, so they are walked deliberately rather than reasoned about.
 
 Pass a number of seconds to watch live controller-to-key translation, which is the quickest
 way to check a mapping without launching the game:
@@ -385,7 +404,9 @@ every other device forwards untouched.
 
 Everything is remappable in `dinput8_xinput.ini` next to the game executable. Values are
 DirectInput scan codes in hex, or `MOUSE1`..`MOUSE8`; `0` unmaps. `Log=1` writes
-`dinput8_xinput.log` for troubleshooting.
+`dinput8_xinput.log` for troubleshooting — and if controller support cannot start at all
+(no XInput runtime on the machine, or a failed allocation), that is written to the log and
+shown in a dialog whether or not `Log` is on, rather than the pad quietly doing nothing.
 
 Movement is digital because the game has no analog movement path — there is nothing to
 feed an analog value into. Look is genuinely analog, since it becomes relative mouse

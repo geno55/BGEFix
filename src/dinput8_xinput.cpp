@@ -107,6 +107,9 @@ static const ProxyConfig kProxyConfig = {
 
 static HMODULE g_xinput = NULL;
 static PFN_XInputGetState g_XInputGetState = NULL;
+/* Whether the one attempt to load an XInput runtime has been made. Under the module
+ * lock, like the pointer it guards. */
+static BOOL g_xinputTried = FALSE;
 
 /* Two locks, each with one job. The module lock in proxy_common.h covers lazy module
  * loading (the chain DLL and the XInput runtime); g_padLock covers the pad sample and the
@@ -295,10 +298,10 @@ static void LoadConfig(void)
  * already hold g_padLock; that ordering is fine and never reversed. */
 static void InitXInput(void)
 {
-    if (g_XInputGetState) return;
+    if (g_XInputGetState || g_xinputTried) return;
     if (!ProxyEnterModuleLock()) return;
 
-    if (!g_XInputGetState) {   /* another thread may have loaded it while we waited */
+    if (!g_XInputGetState && !g_xinputTried) {  /* another thread may have gone first */
         const wchar_t* names[] = { L"xinput1_4.dll", L"xinput1_3.dll", L"xinput9_1_0.dll" };
         for (int i = 0; i < 3; ++i) {
             g_xinput = LoadLibraryW(names[i]);
@@ -308,7 +311,16 @@ static void InitXInput(void)
                 FreeLibrary(g_xinput); g_xinput = NULL;
             }
         }
-        if (!g_XInputGetState) Log("[xinput] no XInput runtime found");
+
+        /* Set before reporting, and never retried: RebuildSample calls this on every
+         * sample, so a machine with no XInput runtime would otherwise attempt three
+         * LoadLibrary calls every 2 ms - and, now that the failure is reported, write a
+         * line to the log every 2 ms with it. One attempt, one report. */
+        g_xinputTried = TRUE;
+        if (!g_XInputGetState)
+            ProxyDegraded("dinput8.dll found no XInput runtime (xinput1_4.dll, "
+                          "xinput1_3.dll or xinput9_1_0.dll). Controller support is off "
+                          "for this session; keyboard and mouse still work.");
     }
     ProxyLeaveModuleLock();
 }
@@ -520,7 +532,7 @@ public:
         ULONG n = real_->Release();
         if (n == 0) {
             this->~DIDeviceProxy();
-            HeapFree(GetProcessHeap(), 0, this);
+            ProxyFree(this);
         }
         return n;
     }
@@ -740,7 +752,7 @@ public:
         ULONG n = real_->Release();
         if (n == 0) {
             this->~DI8Proxy();
-            HeapFree(GetProcessHeap(), 0, this);
+            ProxyFree(this);
         }
         return n;
     }
@@ -755,8 +767,16 @@ public:
         const bool isMs = (IsEqualGUID(rguid, GUID_SysMouse) != 0);
         if (!isKb && !isMs) return hr;               /* leave other devices alone */
 
-        void* mem = HeapAlloc(GetProcessHeap(), 0, sizeof(DIDeviceProxy));
-        if (!mem) return hr;
+        void* mem = ProxyAlloc(sizeof(DIDeviceProxy));
+        if (!mem) {
+            /* The game gets the real device and keeps its keyboard and mouse. It is the
+             * pad that silently stops existing, which from the player's side is
+             * indistinguishable from the controller component never having installed. */
+            ProxyDegraded("dinput8.dll could not wrap the DirectInput %s (out of memory). "
+                          "Controller input will not reach the game; keyboard and mouse "
+                          "still work.", isKb ? "keyboard" : "mouse");
+            return hr;
+        }
         DIDeviceProxy* w = new (mem) DIDeviceProxy(*out, isKb);
 
         Log("[device] wrapped %s 0x%08X as 0x%08X", isKb ? "keyboard" : "mouse",
@@ -806,8 +826,15 @@ HRESULT WINAPI DirectInput8Create(HINSTANCE hinst, DWORD ver, REFIID riid,
     HRESULT hr = fn(hinst, ver, riid, ppvOut, punkOuter);
     if (FAILED(hr) || !ppvOut || !*ppvOut) return hr;
 
-    void* mem = HeapAlloc(GetProcessHeap(), 0, sizeof(DI8Proxy));
-    if (!mem) return hr;
+    void* mem = ProxyAlloc(sizeof(DI8Proxy));
+    if (!mem) {
+        /* Hand back the real IDirectInput8 rather than failing the call, which would
+         * leave the game with no input at all. Nothing downstream gets wrapped, so
+         * controller support is simply gone. */
+        ProxyDegraded("dinput8.dll could not wrap DirectInput (out of memory). Controller "
+                      "support is off for this session; keyboard and mouse still work.");
+        return hr;
+    }
 
     /* IDirectInput8W has the same vtable layout, so the ANSI wrapper serves both. */
     DI8Proxy* w = new (mem) DI8Proxy((IDirectInput8A*)*ppvOut);

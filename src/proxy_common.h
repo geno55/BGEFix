@@ -80,6 +80,24 @@ static wchar_t  g_logPath[MAX_PATH] = {0};
 
 /* ------------------------------------------------------------------ logging */
 
+/* Appends one line. Unconditional - the Log=0 check belongs to the caller, because a
+ * failure report has to be written whether or not the user turned logging on. */
+static void ProxyLogWrite(const char* text, int len)
+{
+    if (!g_logPath[0] || len <= 0) return;
+
+    HANDLE h = CreateFileW(g_logPath, FILE_APPEND_DATA, FILE_SHARE_READ, NULL,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    SetFilePointer(h, 0, NULL, FILE_END);
+    WriteFile(h, text, (DWORD)len, &written, NULL);
+    WriteFile(h, "\r\n", 2, &written, NULL);
+    CloseHandle(h);
+}
+
+/* Tracing, for someone who has turned Log=1 on to diagnose something. Silent by default.
+ * A failure the user needs to know about is NOT this - see ProxyDegraded. */
 static void Log(const char* fmt, ...)
 {
     if (!g_log || !g_logPath[0]) return;
@@ -89,16 +107,105 @@ static void Log(const char* fmt, ...)
     va_start(ap, fmt);
     int n = wvsprintfA(buf, fmt, ap);
     va_end(ap);
+    ProxyLogWrite(buf, n);
+}
+
+/* ------------------------------------------------------------------ degradation */
+
+static LONG g_degradedShown = 0;
+
+/*
+ * The proxy could not do the thing it was installed to do, but the process can carry on
+ * without it. Every such site MUST report through here rather than just returning.
+ *
+ * Carrying on is usually the right call - a game that starts and misses one feature beats
+ * a game that refuses to start - but a behaviour change the user cannot see is not. If
+ * the d3d9 proxy quietly gives up, the game goes back to exclusive fullscreen and the HUD
+ * corruption this whole tool exists to prevent comes back, looking exactly like the fix
+ * simply not working. So both halves of this are load-bearing:
+ *
+ *   The log line is written even when Log=0. Log defaults to 0, so the old
+ *   Log("WARNING ...") at these sites reached nobody; the report has to survive the
+ *   default settings or it is not a report.
+ *
+ *   The first failure per process is also shown as a message box, because nobody reads a
+ *   log they do not know exists. Once per process, not once per site: a machine failing
+ *   these allocations will fail them repeatedly, and a dialog storm helps no one. Set
+ *   BGEFIX_NO_UI=1 in the environment to suppress the box - the log line is still
+ *   written, and the tests use it to assert on this path.
+ *
+ * Never call this from DllMain: MessageBox inside the loader lock can deadlock. Every
+ * caller is an export or an interface method, which is well clear of it.
+ */
+static void ProxyDegraded(const char* fmt, ...)
+{
+    /* Every buffer here is 1024 bytes because that is wsprintf's documented maximum
+     * output - it cannot write more, so none of these can overflow. */
+    char msg[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = wvsprintfA(msg, fmt, ap);
+    va_end(ap);
     if (n < 0) return;
 
-    HANDLE h = CreateFileW(g_logPath, FILE_APPEND_DATA, FILE_SHARE_READ, NULL,
-                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) return;
-    DWORD written = 0;
-    SetFilePointer(h, 0, NULL, FILE_END);
-    WriteFile(h, buf, (DWORD)n, &written, NULL);
-    WriteFile(h, "\r\n", 2, &written, NULL);
-    CloseHandle(h);
+    char line[1024];
+    int m = wsprintfA(line, "[degraded] %s", msg);
+    ProxyLogWrite(line, m);
+
+    if (InterlockedCompareExchange(&g_degradedShown, 1, 0) != 0) return;
+    if (GetEnvironmentVariableA("BGEFIX_NO_UI", NULL, 0) != 0) return;
+
+    /* TOPMOST and SETFOREGROUND because a game may already own the screen by the time
+     * this fires - the d3d9 sites both run before any fullscreen device exists, but the
+     * dinput8 ones can fire whenever the game gets round to creating its input. If the
+     * box is still missed, the log line above it is the durable record. */
+    char box[1024];
+    wsprintfA(box, "%s\r\n\r\nThe game will keep running. Details were written to:\r\n%S",
+              msg, g_logPath);
+    MessageBoxA(NULL, box, "Beyond Good & Evil fix",
+                MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
+}
+
+/* ------------------------------------------------------------------ allocation */
+
+/* Every wrapper object goes through these. Two reasons they are not bare HeapAlloc calls:
+ * the out-of-memory branch below each of them is the one path that changes what the game
+ * does, and it is the one path no ordinary run will ever take - so build_test.cmd builds a
+ * second pair of DLLs with BGEFIX_TEST_OOM defined and the tests walk it for real.
+ *
+ * The shipping build compiles to a plain HeapAlloc; nothing below survives /DNDEBUG
+ * without the test define. */
+#ifdef BGEFIX_TEST_OOM
+static LONG g_allocCount = 0;
+
+/* Allocations to let through before failing everything after them, read from
+ * BGEFIX_TEST_OOM_AFTER (default 0 = fail the very first). It takes a number rather than
+ * a flag so a test can reach the SECOND allocation site in a call chain: the d3d9 device
+ * wrapper is only attempted once the IDirect3D9 wrapper exists. */
+static long ProxyTestOomAfter(void)
+{
+    char buf[16];
+    DWORD n = GetEnvironmentVariableA("BGEFIX_TEST_OOM_AFTER", buf, sizeof(buf));
+    if (n == 0 || n >= sizeof(buf)) return 0;
+
+    long v = 0;
+    for (DWORD i = 0; i < n && buf[i] >= '0' && buf[i] <= '9'; ++i)
+        v = v * 10 + (buf[i] - '0');
+    return v;
+}
+#endif
+
+static void* ProxyAlloc(SIZE_T bytes)
+{
+#ifdef BGEFIX_TEST_OOM
+    if (InterlockedIncrement(&g_allocCount) > ProxyTestOomAfter()) return NULL;
+#endif
+    return HeapAlloc(GetProcessHeap(), 0, bytes);
+}
+
+static void ProxyFree(void* p)
+{
+    if (p) HeapFree(GetProcessHeap(), 0, p);
 }
 
 /* ------------------------------------------------------------------ config */

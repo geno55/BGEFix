@@ -18,6 +18,7 @@
 #include <xinput.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "pad_support.h"
 
 /* The one thing the Windows SDK's dinput.h does not carry: DIDFT_OPTIONAL existed only
@@ -233,6 +234,98 @@ static void TestSequencing(void)
     check("a stale anchor never rewinds the counter", PadSeqAfter(stale, after), buf);
 }
 
+/* ------------------------------------------------------------------ failure path
+ *
+ * The proxy's out-of-memory branch hands the game the real DirectInput and stops adding
+ * controller support. That is the right call - failing the call outright would leave the
+ * game with no input at all - but from the player's chair it is indistinguishable from
+ * the controller component never having been installed, so it has to be announced.
+ *
+ * dist\oom\dinput8.dll is this same source built with BGEFIX_TEST_OOM, so the wrapper
+ * allocation fails on demand. Log=0 here is deliberate: it is the default the installer
+ * writes, and a report that only appears once the user has already enabled logging is not
+ * a report. BGEFIX_NO_UI suppresses only the message box, which would otherwise hang an
+ * unattended run.
+ */
+static void PathBesideExe(char* out, const char* leaf)
+{
+    DWORD n = GetModuleFileNameA(NULL, out, MAX_PATH);
+    while (n > 0 && out[n - 1] != '\\' && out[n - 1] != '/') --n;
+    out[n] = 0;
+    lstrcatA(out, leaf);
+}
+
+static void WriteTextFile(const char* path, const char* text)
+{
+    HANDLE h = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD w = 0;
+    WriteFile(h, text, lstrlenA(text), &w, NULL);
+    CloseHandle(h);
+}
+
+static void ReadTextFile(const char* path, char* buf, DWORD cap)
+{
+    buf[0] = 0;
+    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD got = 0;
+    ReadFile(h, buf, cap - 1, &got, NULL);
+    buf[got] = 0;
+    CloseHandle(h);
+}
+
+static void TestOomIsLoud(void)
+{
+    char dll[MAX_PATH], ini[MAX_PATH], log[MAX_PATH], buf[8192], detail[160];
+
+    printf("\n  -- out of memory: degradation is announced, not silent --\n");
+
+    PathBesideExe(dll, "oom\\dinput8.dll");
+    PathBesideExe(ini, "oom\\dinput8_xinput.ini");
+    PathBesideExe(log, "oom\\dinput8_xinput.log");
+
+    WriteTextFile(ini, "[General]\r\nLog=0\r\n");
+    DeleteFileA(log);
+    SetEnvironmentVariableA("BGEFIX_NO_UI", "1");
+    SetEnvironmentVariableA("BGEFIX_TEST_OOM_AFTER", "0");   /* fail the first wrapper */
+
+    HMODULE m = LoadLibraryA(dll);
+    check("forced-OOM build loads", m != NULL, dll);
+    if (!m) return;
+
+    typedef HRESULT (WINAPI *PFN)(HINSTANCE, DWORD, REFIID, LPVOID*, LPUNKNOWN);
+    PFN create = (PFN)GetProcAddress(m, "DirectInput8Create");
+    IDirectInput8A* di = NULL;
+    HRESULT hr = create ? create(GetModuleHandleA(NULL), DIRECTINPUT_VERSION,
+                                 IID_IDirectInput8A, (LPVOID*)&di, NULL) : E_FAIL;
+    wsprintfA(detail, "hr=0x%08X", (unsigned)hr);
+    check("the game still gets a usable IDirectInput8", SUCCEEDED(hr) && di, detail);
+
+    /* Pass-through has to be real pass-through: the game's keyboard must still work. */
+    IDirectInputDevice8A* kb = NULL;
+    if (di) {
+        hr = di->CreateDevice(GUID_SysKeyboard, &kb, NULL);
+        wsprintfA(detail, "hr=0x%08X", (unsigned)hr);
+        check("the game still gets its keyboard", SUCCEEDED(hr) && kb, detail);
+    }
+
+    ReadTextFile(log, buf, sizeof(buf));
+    check("the failure is logged even with Log=0",
+          strstr(buf, "[degraded]") != NULL, buf[0] ? "" : "no log written at all");
+    check("the log says what the user loses",
+          strstr(buf, "Controller support is off") != NULL, "");
+
+    if (kb) kb->Release();
+    if (di) di->Release();
+    FreeLibrary(m);
+
+    SetEnvironmentVariableA("BGEFIX_TEST_OOM_AFTER", NULL);
+    SetEnvironmentVariableA("BGEFIX_NO_UI", NULL);
+}
+
 int main(int argc, char** argv)
 {
     int seconds = (argc > 1) ? atoi(argv[1]) : 0;
@@ -340,6 +433,7 @@ int main(int argc, char** argv)
     TestStickMaths();
     TestScanPolicy();
     TestSequencing();
+    TestOomIsLoud();
 
     if (seconds > 0) {
         printf("\n  Live for %d seconds - move the sticks / press buttons:\n\n", seconds);

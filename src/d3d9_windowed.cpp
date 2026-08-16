@@ -247,7 +247,7 @@ public:
         ULONG n = real_->Release();
         if (n == 0) {
             this->~D3D9DeviceProxy();
-            HeapFree(GetProcessHeap(), 0, this);
+            ProxyFree(this);
         }
         return n;
     }
@@ -596,7 +596,7 @@ public:
         ULONG n = real_->Release();
         if (n == 0) {
             this->~D3D9Proxy();
-            HeapFree(GetProcessHeap(), 0, this);
+            ProxyFree(this);
         }
         return n;
     }
@@ -681,7 +681,7 @@ public:
         if (pp) ApplyWindowMode(target, pp->BackBufferWidth, pp->BackBufferHeight, TRUE);
 
         if (ppDevice && *ppDevice) {
-            void* mem = HeapAlloc(GetProcessHeap(), 0, sizeof(D3D9DeviceProxy));
+            void* mem = ProxyAlloc(sizeof(D3D9DeviceProxy));
             if (mem) {
                 D3D9DeviceProxy* d = new (mem) D3D9DeviceProxy(*ppDevice, this, real_, target);
                 Log("[create] wrapped IDirect3DDevice9 0x%08X as 0x%08X", PTRV(*ppDevice), PTRV(d));
@@ -689,8 +689,14 @@ public:
             }
             else {
                 /* Hand back the real device rather than failing the call: the game still
-                 * runs, it just loses windowed enforcement across a Reset. */
-                Log("[create] WARNING out of memory, device left unwrapped");
+                 * runs, and the window IS windowed right now. What is lost is Reset - the
+                 * game returns to exclusive fullscreen the first time it changes
+                 * resolution or recovers a lost device, mid-session, which is far too
+                 * subtle to leave unannounced. */
+                ProxyDegraded("d3d9.dll could not wrap the Direct3D device (out of memory). "
+                              "The game is windowed now, but will drop back to exclusive "
+                              "fullscreen the next time it changes resolution or recovers "
+                              "a lost device - and Alt+Tab can corrupt the HUD there.");
             }
         }
         return hr;
@@ -719,8 +725,17 @@ IDirect3D9* WINAPI Direct3DCreate9(UINT sdkVersion)
     IDirect3D9* real = fn(sdkVersion);
     if (!real) return NULL;
 
-    void* mem = HeapAlloc(GetProcessHeap(), 0, sizeof(D3D9Proxy));
-    if (!mem) return real;   /* degrade to pass-through rather than fail the game */
+    void* mem = ProxyAlloc(sizeof(D3D9Proxy));
+    if (!mem) {
+        /* Pass the real interface through rather than failing the call - returning NULL
+         * here aborts the game's startup entirely. But this is total loss of the fix: no
+         * present parameters are ever rewritten, so the game runs exclusive fullscreen
+         * exactly as if the DLL were not installed. Say so. */
+        ProxyDegraded("d3d9.dll could not wrap Direct3D (out of memory). The game will "
+                      "run in exclusive fullscreen, where Alt+Tab can corrupt the HUD or "
+                      "crash it - the very thing this fix installs to prevent.");
+        return real;
+    }
 
     D3D9Proxy* w = new (mem) D3D9Proxy(real);
     Log("[init] wrapped IDirect3D9 0x%08X as 0x%08X (mode=%d)", PTRV(real), PTRV(w), g_mode);

@@ -17,6 +17,7 @@
 #include <windows.h>
 #include <d3d9.h>
 #include <stdio.h>
+#include <string.h>
 
 static int g_fail = 0;
 static void check(const char* what, int ok, const char* detail)
@@ -24,6 +25,124 @@ static void check(const char* what, int ok, const char* detail)
     printf("  %-4s %s%s%s\n", ok ? "PASS" : "FAIL", what,
            detail && *detail ? " -> " : "", detail ? detail : "");
     if (!ok) g_fail++;
+}
+
+/* ------------------------------------------------------------------ helpers */
+
+/* Paths are built from the test executable's own folder rather than the working
+ * directory, so the fixtures are found however the test is launched. */
+static void PathBesideExe(char* out, const char* leaf)
+{
+    DWORD n = GetModuleFileNameA(NULL, out, MAX_PATH);
+    while (n > 0 && out[n - 1] != '\\' && out[n - 1] != '/') --n;
+    out[n] = 0;
+    lstrcatA(out, leaf);
+}
+
+static void WriteTextFile(const char* path, const char* text)
+{
+    HANDLE h = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD w = 0;
+    WriteFile(h, text, lstrlenA(text), &w, NULL);
+    CloseHandle(h);
+}
+
+/* Whole file into buf; empty string if it is not there. */
+static void ReadTextFile(const char* path, char* buf, DWORD cap)
+{
+    buf[0] = 0;
+    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD got = 0;
+    ReadFile(h, buf, cap - 1, &got, NULL);
+    buf[got] = 0;
+    CloseHandle(h);
+}
+
+/* ------------------------------------------------------------------ failure path
+ *
+ * What the proxy does when it cannot allocate a wrapper. That branch decides whether the
+ * game runs in exclusive fullscreen - the exact condition this DLL is installed to
+ * prevent - and no ordinary run reaches it, so it is walked here deliberately, against
+ * dist\oom\d3d9.dll: the same source built with BGEFIX_TEST_OOM.
+ *
+ * The two things being asserted are the ones a user actually experiences: the game keeps
+ * running, and the loss is REPORTED. Reported specifically with Log=0, the default - a
+ * warning written only when the user has already turned logging on is a warning nobody
+ * receives.
+ *
+ * BGEFIX_NO_UI suppresses the message box (a modal dialog would hang an unattended test
+ * run); it does not suppress the log line, which is the thing under test.
+ */
+static void TestOomIsLoud(void)
+{
+    char dll[MAX_PATH], ini[MAX_PATH], log[MAX_PATH], buf[8192], detail[256];
+
+    printf("\n  -- out of memory: degradation is announced, not silent --\n");
+
+    PathBesideExe(dll, "oom\\d3d9.dll");
+    PathBesideExe(ini, "oom\\d3d9_windowed.ini");
+    PathBesideExe(log, "oom\\d3d9_windowed.log");
+
+    /* Log=0 is the default the installer writes; the report must survive it. */
+    WriteTextFile(ini, "[Display]\r\nMode=1\r\n\r\n[General]\r\nLog=0\r\n");
+    DeleteFileA(log);
+    SetEnvironmentVariableA("BGEFIX_NO_UI", "1");
+
+    /* Let the IDirect3D9 wrapper through and fail the DEVICE wrapper: that is the
+     * interesting half, where the game is windowed right now but loses it at the next
+     * Reset. */
+    SetEnvironmentVariableA("BGEFIX_TEST_OOM_AFTER", "1");
+
+    HMODULE m = LoadLibraryA(dll);
+    check("forced-OOM build loads", m != NULL, dll);
+    if (!m) return;
+
+    typedef IDirect3D9* (WINAPI *PFN)(UINT);
+    PFN create = (PFN)GetProcAddress(m, "Direct3DCreate9");
+    IDirect3D9* d3d = create ? create(D3D_SDK_VERSION) : NULL;
+    check("the game still gets a usable IDirect3D9", d3d != NULL, "");
+    if (!d3d) { FreeLibrary(m); return; }
+
+    HWND hwnd = CreateWindowExA(0, "BGEProxyTest", "oom test",
+                                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                                120, 120, 640, 480, NULL, NULL, GetModuleHandleA(NULL), NULL);
+
+    D3DPRESENT_PARAMETERS pp; ZeroMemory(&pp, sizeof(pp));
+    pp.BackBufferWidth  = 640;
+    pp.BackBufferHeight = 480;
+    pp.BackBufferFormat = D3DFMT_X8R8G8B8;
+    pp.BackBufferCount  = 1;
+    pp.SwapEffect       = D3DSWAPEFFECT_DISCARD;
+    pp.hDeviceWindow    = hwnd;
+    pp.Windowed         = FALSE;
+    pp.FullScreen_RefreshRateInHz = 60;
+
+    IDirect3DDevice9* dev = NULL;
+    HRESULT hr = d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, hwnd,
+                                   D3DCREATE_SOFTWARE_VERTEXPROCESSING, &pp, &dev);
+    wsprintfA(detail, "hr=0x%08X", (unsigned)hr);
+    check("the game still gets a working device", SUCCEEDED(hr) && dev != NULL, detail);
+
+    /* Degraded means "loses windowed mode at the next Reset", not "does nothing now". */
+    check("this session is still windowed", pp.Windowed == TRUE, "");
+
+    ReadTextFile(log, buf, sizeof(buf));
+    check("the failure is logged even with Log=0",
+          strstr(buf, "[degraded]") != NULL, buf[0] ? "" : "no log written at all");
+    check("the log says what the user loses",
+          strstr(buf, "exclusive fullscreen") != NULL, "");
+
+    if (dev) dev->Release();
+    d3d->Release();
+    if (hwnd) DestroyWindow(hwnd);
+    FreeLibrary(m);
+
+    SetEnvironmentVariableA("BGEFIX_TEST_OOM_AFTER", NULL);
+    SetEnvironmentVariableA("BGEFIX_NO_UI", NULL);
 }
 
 int main(void)
@@ -162,6 +281,8 @@ int main(void)
     if (dev) dev->Release();
     d3d->Release();
     DestroyWindow(hwnd);
+
+    TestOomIsLoud();
 
     printf("\n  %s (%d failures)\n", g_fail ? "FAILED" : "ALL PASS", g_fail);
     return g_fail ? 1 : 0;

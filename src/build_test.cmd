@@ -15,6 +15,27 @@ if errorlevel 1 exit /b 1
 
 :have_cl
 pushd "%OUTDIR%"
+
+rem --- forced-out-of-memory copies of both proxies ---------------------------
+rem Same sources, built with BGEFIX_TEST_OOM so ProxyAlloc fails on demand. The
+rem out-of-memory branches decide what the game does when the fix cannot be applied,
+rem and no ordinary run ever reaches them; the tests load these copies and walk them.
+rem They are test fixtures - the installer never sees them.
+if not exist oom mkdir oom
+echo Building forced-OOM proxies for the failure-path tests ...
+cl /nologo /LD /MT /O1 /W4 /WX /EHsc /DNDEBUG /DBGEFIX_TEST_OOM ^
+   /Fo:oom\ /Fe:oom\d3d9.dll "%~dp0d3d9_windowed.cpp" ^
+   /link /DEF:"%~dp0d3d9_windowed.def" /MACHINE:X86 kernel32.lib user32.lib
+set RC=%ERRORLEVEL%
+if not "%RC%"=="0" ( echo BUILD FAILED & popd & exit /b %RC% )
+
+cl /nologo /LD /MT /O1 /W4 /WX /EHsc /DNDEBUG /DBGEFIX_TEST_OOM ^
+   /Fo:oom\ /Fe:oom\dinput8.dll "%~dp0dinput8_xinput.cpp" ^
+   /link /DEF:"%~dp0dinput8_xinput.def" /MACHINE:X86 kernel32.lib user32.lib dxguid.lib
+set RC=%ERRORLEVEL%
+del /q oom\*.obj oom\*.exp oom\*.lib 2>nul
+if not "%RC%"=="0" ( echo BUILD FAILED & popd & exit /b %RC% )
+
 rem dxguid.lib (Windows SDK) supplies GUID_SysKeyboard / GUID_Key / IID_IDirectInput8A.
 cl /nologo /MT /O1 /W4 /EHsc /DNDEBUG /Fe:test_proxy.exe "%~dp0test_proxy.cpp" ^
    /link /MACHINE:X86 kernel32.lib user32.lib
