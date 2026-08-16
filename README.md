@@ -142,11 +142,11 @@ powershell -ExecutionPolicy Bypass -File .\Fix-BGE.ps1 -Revert
 This tool does three separable things, and the controller proxy in particular has nothing
 to do with Alt+Tab. Each is selected by name, with one polarity:
 
-| Component | What it does | Needs the others? |
-|---|---|---|
-| `AltTab` | Replaces GOG's shim database with one applying only `SingleProcAffinity` | no |
-| `Windowed` | Installs the d3d9 proxy, ending exclusive fullscreen | no |
-| `Controller` | Installs the dinput8 XInput proxy | **no** |
+| Component | What it does |
+|---|---|
+| `AltTab` | Replaces GOG's shim database with one applying only `SingleProcAffinity` |
+| `Windowed` | Installs the d3d9 proxy, ending exclusive fullscreen |
+| `Controller` | Installs the dinput8 XInput proxy |
 
 ```bash
 powershell -ExecutionPolicy Bypass -File .\Fix-BGE.ps1 -Component Controller
