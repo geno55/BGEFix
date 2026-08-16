@@ -263,6 +263,14 @@ download URL — in order to set one boolean.
   keys are read from `[General]` in both. It was previously pasted into both `.cpp`
   files, where the copies had already begun to drift — including reading `Log` and
   `Chain` from a different ini section in each.
+- **The window must end up active.** An exclusive-fullscreen device activates the window
+  as part of taking the display; a windowed one does not, and BGE reads an inactive
+  window as "not playing" — it stops polling DirectInput and silences audio, so the game
+  ignores the controller until you Alt+Tab away and back. The proxy therefore activates
+  the presentation window itself. Activation and *foreground* are separate: Windows
+  refuses `SetForegroundWindow` to a process that neither owns the foreground nor
+  received the last input, so the test asserts activation unconditionally and the
+  foreground only when the OS was willing to grant it.
 - **A degraded proxy says so.** If a wrapper cannot be allocated, or no XInput runtime is
   present, the DLL hands the real interface through so the game keeps running — but that
   is a behaviour change the player would otherwise have no way to see, and for the d3d9

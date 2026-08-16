@@ -159,6 +159,16 @@ int main(void)
                                 100, 100, 800, 600, NULL, NULL, wc.hInstance, NULL);
     if (!hwnd) { printf("could not create window\n"); return 2; }
 
+    /* A second window on the same thread, activated so the presentation window starts
+     * INACTIVE. Without it, CreateWindowEx has usually already activated hwnd and the
+     * activation check below would pass whether or not the proxy did anything - which is
+     * the bug it exists to catch. SetActiveWindow is thread-local and never refused, so
+     * setting this up cannot itself depend on what else is on the desktop. */
+    HWND decoy = CreateWindowExA(0, "BGEProxyTest", "decoy",
+                                 WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                                 40, 40, 200, 120, NULL, NULL, wc.hInstance, NULL);
+    if (decoy) SetActiveWindow(decoy);
+
     HMODULE m = LoadLibraryA("d3d9.dll");
     check("proxy d3d9.dll loads", m != NULL, "");
     if (!m) return 2;
@@ -224,10 +234,43 @@ int main(void)
     /* An exclusive-fullscreen device activates the window as part of taking the display.
      * Windowed, nothing does that for us - and BGE treats an inactive window as "not
      * playing": it stops polling DirectInput and silences audio. The game then ignores
-     * the controller entirely until you alt-tab away and back. */
+     * the controller entirely until you alt-tab away and back.
+     *
+     * Two separate things get checked here, because only one of them is the proxy's to
+     * guarantee:
+     *
+     *   Activation is. SetActiveWindow/SetFocus act on the window's own thread and the OS
+     *   never refuses them, so "the proxy activated the presentation window" is a hard
+     *   assertion. The decoy above is what gives it teeth: activation starts elsewhere,
+     *   so a proxy that went back to SWP_NOACTIVATE and dropped the activation calls
+     *   fails this line rather than coasting on CreateWindowEx having activated hwnd.
+     *
+     *   Foreground is NOT. SetForegroundWindow is refused outright for a process that
+     *   neither owns the foreground nor received the last input event - which is exactly
+     *   a test run launched from a script while the user is in another window. That made
+     *   this check fail intermittently on a proxy that was behaving perfectly. So the
+     *   foreground half asserts only when the OS was willing to grant this process the
+     *   foreground at all, and reports SKIP with the reason when it was not. */
+    HWND active = GetActiveWindow();
+    wsprintfA(buf, "active=0x%08X ours=0x%08X", (unsigned)(UINT_PTR)active, (unsigned)(UINT_PTR)hwnd);
+    check("window is ACTIVATED after CreateDevice", active == hwnd, buf);
+
     HWND fg = GetForegroundWindow();
-    wsprintfA(buf, "foreground=0x%08X ours=0x%08X", (unsigned)(UINT_PTR)fg, (unsigned)(UINT_PTR)hwnd);
-    check("window is ACTIVE after CreateDevice", fg == hwnd, buf);
+    DWORD fgPid = 0, ourPid = GetCurrentProcessId();
+    if (fg) GetWindowThreadProcessId(fg, &fgPid);
+
+    if (fgPid == ourPid) {
+        /* The OS let this process hold the foreground, so the proxy's SetForegroundWindow
+         * had to land on the presentation window and not, say, the decoy. */
+        wsprintfA(buf, "foreground=0x%08X ours=0x%08X",
+                  (unsigned)(UINT_PTR)fg, (unsigned)(UINT_PTR)hwnd);
+        check("window is FOREGROUND after CreateDevice", fg == hwnd, buf);
+    }
+    else {
+        printf("  SKIP window is FOREGROUND after CreateDevice -> another process owns "
+               "the foreground, so Windows refuses this one the change; activation, "
+               "checked above, is the part the proxy controls\n");
+    }
 
     /* ---------------------------------------------------------------- Reset --------
      * The other place a D3D9 app sets Windowed. This is what the game does on
@@ -281,6 +324,7 @@ int main(void)
     if (dev) dev->Release();
     d3d->Release();
     DestroyWindow(hwnd);
+    if (decoy) DestroyWindow(decoy);
 
     TestOomIsLoud();
 
