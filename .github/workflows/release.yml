@@ -1,0 +1,83 @@
+name: release
+
+# Tag-triggered, because the tag is the thing that identifies a release. workflow_dispatch is
+# here so that a fix to this file can be re-run against a tag that already exists - otherwise
+# the only way to retry a failed publish is to invent a version number nobody asked for.
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to publish, e.g. v1.0.0'
+        required: true
+
+permissions:
+  contents: write   # gh release create writes a release and uploads its assets
+
+jobs:
+  release:
+    # Windows, not a container: the payload is Windows PowerShell and two 32-bit Windows DLLs,
+    # and the packaging script verifies both by reading their PE headers.
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      # A release that fails its own test suite should not exist. The suite synthesises its
+      # fixtures and skips the few checks that need a real GOG install, so it runs on a bare
+      # runner; its exit code is the number of failures.
+      - name: Test
+        shell: powershell
+        run: .\src\test_installer.ps1
+
+      # Refuses to package if the tag disagrees with the version Fix-BGE.ps1 prints, if either
+      # DLL is not a 32-bit PE carrying the installer's proxy marker, or if the archive it just
+      # wrote does not contain exactly the payload.
+      - name: Package
+        shell: powershell
+        run: .\tools\Build-Release.ps1 -Version $env:TAG
+
+      - name: Publish
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $zip = "out\BGEFix-$env:TAG.zip"
+          $sha = ((Get-Content -LiteralPath "$zip.sha256" -Raw) -split ' ')[0].Trim()
+
+          # Notes are written here rather than generated from the commit log: the thing a
+          # visitor needs on this page is how to install it, not a list of refactors.
+          $notes = @(
+            'Fixes for the GOG.com release of Beyond Good & Evil (2003): Alt+Tab, windowed',
+            'mode, and XInput gamepad support. No third-party downloads.',
+            '',
+            '## Install',
+            '',
+            "1. Download ``BGEFix-$env:TAG.zip`` below.",
+            '2. Extract it anywhere.',
+            '3. Double-click **BGEFix.cmd**.',
+            '',
+            'It asks which of the three fixes you want, shows what is already installed, and',
+            'can report the current state or remove everything again. The game folder is found',
+            'automatically. Every change is backed up and reversible.',
+            '',
+            'Requires Windows 10 or 11 and administrator rights - the installer asks for them',
+            'when it needs them, and previews without them.',
+            '',
+            '## Verify the download',
+            '',
+            '```',
+            "SHA256  $sha",
+            '```',
+            '',
+            'See the [README](https://github.com/geno55/BGEFix#readme) for what it changes and why.'
+          ) -join "`n"
+
+          gh release create $env:TAG $zip "$zip.sha256" --title "BGEFix $env:TAG" --notes $notes
+          exit $LASTEXITCODE

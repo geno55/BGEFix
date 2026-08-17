@@ -10,12 +10,17 @@ dist/test_proxy.exe
 dist/test_dinput.exe
 # forced-out-of-memory proxy copies, built by build_test.cmd to walk the failure paths
 dist/oom/
+# the d3d9 trace build's own output: a copy of the proxy, its log, and dumped textures
+dist/trace/
 dist/d3d9_windowed.log
 dist/d3d9_windowed.ini
 dist/dinput8_xinput.log
 dist/dinput8_xinput.ini
 
 *.bak
+
+# release zips, rebuilt from the tag by tools\Build-Release.ps1
+out/
 
 # Note: dist/d3d9.dll IS committed on purpose. The installer defaults to it so
 # users do not need a C++ toolchain. Rebuild with src\build.cmd.
