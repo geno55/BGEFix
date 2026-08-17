@@ -30,6 +30,18 @@ $src  = Join-Path $repo 'Fix-BGE.ps1'
 $tmp  = Join-Path ([System.IO.Path]::GetTempPath()) ("bgefix-installer-test-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tmp | Out-Null
 
+# A stand-in game folder for the checks that run the real script, so they do not depend on
+# this machine having Beyond Good & Evil installed. -GamePath is tried ahead of the registry
+# and the well-known locations, and all the script needs to find there is BGE.exe.
+#
+# Without it those runs die at "could not find the game folder" and their assertions pass or
+# fail for a reason that has nothing to do with what they test: on a machine with no install,
+# an invocation that was WRONGLY accepted still exits non-zero, so the contradiction checks
+# below would have reported success while testing nothing.
+$stubGame = Join-Path $tmp 'stubgame'
+New-Item -ItemType Directory -Path $stubGame | Out-Null
+Set-Content -LiteralPath (Join-Path $stubGame 'BGE.exe') -Value 'a stand-in, not a real executable'
+
 # --- lift the functions and marker constants out of the installer -------------------
 $ast  = [System.Management.Automation.Language.Parser]::ParseFile($src, [ref]$null, [ref]$null)
 $want = 'ConvertTo-ProcessArgument', 'Invoke-SelfElevate',
@@ -556,11 +568,13 @@ public static extern IntPtr LocalFree(IntPtr hMem);
     $ErrorActionPreference = 'Continue'
     try {
         $null = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'Fix-BGE.ps1') `
-                    -ComponentList 'AltTab,Windowed' -WhatIf 2>&1
+                    -ComponentList 'AltTab,Windowed' -GamePath $stubGame -WhatIf 2>&1
         $childCode = $LASTEXITCODE
-        # And confirm the test is not vacuous: the form this replaced really is rejected.
+        # And confirm the test is not vacuous: the form this replaced really is rejected. The
+        # two runs differ only in how the list is spelled, so a pass cannot come from anything
+        # else about the invocation.
         $null = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'Fix-BGE.ps1') `
-                    -Component 'AltTab Windowed' -WhatIf 2>&1
+                    -Component 'AltTab Windowed' -GamePath $stubGame -WhatIf 2>&1
         $naiveCode = $LASTEXITCODE
     }
     finally { $ErrorActionPreference = $savedEap }
@@ -738,10 +752,12 @@ public static extern IntPtr LocalFree(IntPtr hMem);
     try {
         $accepted = @()
         foreach ($c in $contradictions) {
-            $null = & powershell -NoProfile -ExecutionPolicy Bypass -File $script @($c.Args) 2>&1
+            $null = & powershell -NoProfile -ExecutionPolicy Bypass -File $script @($c.Args) `
+                        -GamePath $stubGame 2>&1
             if ($LASTEXITCODE -eq 0) { $accepted += $c.Why }
         }
-        $null = & powershell -NoProfile -ExecutionPolicy Bypass -File $script -WhatIf -Component Controller 2>&1
+        $null = & powershell -NoProfile -ExecutionPolicy Bypass -File $script -WhatIf `
+                    -Component Controller -GamePath $stubGame 2>&1
         $legitCode = $LASTEXITCODE
     }
     finally { $ErrorActionPreference = $savedEap }

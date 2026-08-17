@@ -29,9 +29,9 @@ jobs:
         with:
           ref: ${{ github.event.inputs.tag || github.ref_name }}
 
-      # A release that fails its own test suite should not exist. The suite synthesises its
-      # fixtures and skips the few checks that need a real GOG install, so it runs on a bare
-      # runner; its exit code is the number of failures.
+      # A release that fails its own test suite should not exist. The suite synthesises every
+      # fixture it needs, including a stand-in game folder, and skips the two checks that read
+      # a real goggame.sdb, so it runs on a bare runner. Its exit code is the failure count.
       - name: Test
         shell: powershell
         run: .\src\test_installer.ps1
