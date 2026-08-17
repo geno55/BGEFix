@@ -10,6 +10,47 @@ downloads. Three independent parts, installable separately:
 
 ---
 
+## Install
+
+1. Download **`BGEFix-v1.0.0.zip`** from the [latest release](https://github.com/geno55/BGEFix/releases/latest).
+2. Extract it anywhere.
+3. Double-click **`BGEFix.cmd`**.
+
+It asks which parts you want, and marks the ones you already have:
+
+```
+  Choose what to install
+  ----------------------
+  Three independent fixes. Type a number to turn one on or off.
+  Leaving one off leaves it as it is - off does not mean remove.
+
+   [x] 1  Alt+Tab fix      not installed
+          Drops GOG's IgnoreAltTab shim, keeps the single-core affinity one.
+   [x] 2  Windowed mode    not installed
+          Ends exclusive fullscreen - the reason Alt+Tab corrupted the HUD.
+   [ ] 3  Gamepad support  installed already
+          XInput pads. The GOG build has no gamepad code at all.
+
+  Enter installs: Alt+Tab fix, Windowed mode
+  1-3 toggle    A all    N none    S current state    U uninstall all    Q quit
+```
+
+The game folder is found automatically. `S` reports the current state without changing
+anything, `U` removes everything and puts GOG's own database back, and `Q` costs nothing —
+the menu runs before the UAC prompt, so quitting means nothing was ever elevated.
+
+That is the whole install. Everything below explains what it changes and why; the
+[Usage](#usage) section is for driving it from a script instead, and passing any parameter
+skips the menu.
+
+Verify the download if you like — each release publishes the SHA256 of its zip beside it:
+
+```bash
+powershell -Command "Get-FileHash -Algorithm SHA256 .\BGEFix-v1.0.0.zip"
+```
+
+---
+
 ## The problem
 
 Alt+Tab does nothing in the GOG release. The game does not crash, does not minimise —
@@ -92,6 +133,14 @@ builds are detected but reported as unrecognised.
 
 ## Usage
 
+This section is the command line. If you just want the fix, [double-click
+`BGEFix.cmd`](#install) — everything here is reachable from that menu.
+
+**Passing any parameter skips the menu.** Bare and interactive, the script asks; given
+anything at all, it does exactly what was asked and never prompts for a choice, which is
+what `-Force`, `-WhatIf` and every scripted invocation depend on. A redirected stdin skips
+it too, so a run from a scheduler or another script is never left waiting for input.
+
 Check what state your install is in. Read-only, requires no elevation:
 
 ```bash
@@ -104,10 +153,17 @@ Preview every change without touching anything. Also needs no elevation:
 powershell -ExecutionPolicy Bypass -File .\Fix-BGE.ps1 -WhatIf
 ```
 
-Apply the fix. Prompts for confirmation and elevates automatically:
+Apply the fix. Bare and interactive, this is the invocation that asks which parts you want;
+it then prompts for confirmation and elevates automatically:
 
 ```bash
 powershell -ExecutionPolicy Bypass -File .\Fix-BGE.ps1
+```
+
+Name the parts instead, and it installs exactly those without asking:
+
+```bash
+powershell -ExecutionPolicy Bypass -File .\Fix-BGE.ps1 -Component AltTab,Windowed
 ```
 
 Undo everything:
@@ -296,6 +352,34 @@ way to check a mapping without launching the game:
 ```bash
 src\build_test.cmd 15
 ```
+
+### Releasing
+
+The installer prints its own version, and `tools\Build-Release.ps1` refuses to package a tag
+that disagrees with it — so the number on the download, the number in the release notes and
+the number a bug report quotes are the same number.
+
+```bash
+powershell -ExecutionPolicy Bypass -File .\tools\Build-Release.ps1
+```
+
+That writes `out\BGEFix-v<version>.zip` and its `.sha256`, containing the installer, the
+`BGEFix.cmd` entry point, both prebuilt proxies, this README and the licence. Before it
+writes anything it checks the payload, because a release is the one build nobody can fix in
+place after it ships: both DLLs must be 32-bit PEs — `BGE.exe` silently fails to load a
+64-bit DLL — and both must carry the installer's proxy marker, without which the installer
+would meet its own DLL, take it for a third-party wrapper and chain to it. The archive is
+then read back and its contents compared against the payload list.
+
+To publish, bump `$script:AppVersion` in `Fix-BGE.ps1`, then tag and push:
+
+```bash
+git tag v1.0.0 && git push origin v1.0.0
+```
+
+[`.github/workflows/release.yml`](.github/workflows/release.yml) runs the installer test
+suite, packages the zip, and creates the GitHub release with the zip, its checksum and
+install instructions. A release that fails its own test suite is never published.
 
 ### Configuration
 

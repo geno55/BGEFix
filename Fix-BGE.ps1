@@ -3,7 +3,13 @@
     BGEFix - fixes for the GOG.com release of Beyond Good & Evil (2003).
 
 .DESCRIPTION
-    Three independent fixes, selected with -Component:
+    Three independent fixes. Run this with no arguments - or double-click BGEFix.cmd -
+    and it asks which ones you want, showing what is already installed, with the option
+    to report the current state or remove everything again. Pass any parameter and the
+    menu stays out of the way: the script then does exactly what was asked for, which is
+    what every scripted or unattended invocation relies on.
+
+    The three parts, named by -Component:
 
     AltTab
         The GOG release installs a custom Windows Application Compatibility shim
@@ -58,7 +64,9 @@
                     Alt+Tab, and installable on its own: -Component Controller.
         All         All three.
 
-    Default when installing: AltTab, Windowed. Default when reverting: All.
+    Default when installing: AltTab, Windowed. Default when reverting: All. Those are also
+    what the interactive menu starts with preselected, so the menu and the command line
+    cannot disagree about what "the default" means.
 
 .PARAMETER ProxyPath
     Path to a prebuilt proxy DLL. Defaults to dist\d3d9.dll beside this script.
@@ -102,10 +110,11 @@
     Skip the interactive confirmation prompt.
 
 .EXAMPLE
-    .\Fix-BGE.ps1 -Status
+    # Asks which fixes to install. This is what double-clicking BGEFix.cmd does.
+    .\Fix-BGE.ps1
 
 .EXAMPLE
-    .\Fix-BGE.ps1
+    .\Fix-BGE.ps1 -Status
 
 .EXAMPLE
     .\Fix-BGE.ps1 -GamePath "D:\Games\Beyond Good and Evil" -Force
@@ -165,6 +174,18 @@ param(
     [ValidateSet('AltTab', 'Windowed', 'Controller', 'All')]
     [string[]] $Component,
 
+    # Internal. The same list as -Component, comma-joined into one string.
+    #
+    # It exists because powershell.exe -File cannot pass a multi-valued parameter at all:
+    # every argument is bound as one literal string, so '-Component AltTab,Windowed' arrives
+    # as the single value 'AltTab,Windowed' and fails ValidateSet - which meant any two-part
+    # -Component silently died at the UAC boundary, in the elevated window, after the parent
+    # had already reported the plan. The relaunch forwards the choice here instead, and this
+    # script splits it back into -Component before anything reads it. Use -Component.
+    [Parameter(ParameterSetName = 'Apply')]
+    [Parameter(ParameterSetName = 'Revert')]
+    [string]   $ComponentList,
+
     [Parameter(ParameterSetName = 'Status', Mandatory = $true)]
     [switch]   $Status,
 
@@ -215,6 +236,10 @@ $ErrorActionPreference = 'Stop'
 #region ---------------------------------------------------------------- constants
 
 $script:AppName      = 'BGEFix'
+# The release version, printed in the banner so a bug report identifies which build it came
+# from. tools\Build-Release.ps1 refuses to package a tag that disagrees with this string,
+# so the number on the download and the number the script prints cannot drift apart.
+$script:AppVersion   = '1.0.0'
 $script:StateDir     = Join-Path $env:ProgramData 'BGEFix'
 $script:BackupDir    = Join-Path $script:StateDir  'backup'
 $script:StateFile    = Join-Path $script:StateDir  'state.json'
@@ -299,6 +324,27 @@ function Resolve-Components {
 
     if ($ForRevert) { return $all }
     return @('AltTab', 'Windowed')
+}
+
+function Resolve-ComponentSpec {
+    <#
+        Splits the internal -ComponentList string back into a -Component list, validating it
+        the way ValidateSet would have. Only the elevated relaunch passes it; the parameter's
+        own comment says why a list cannot cross that boundary as a list.
+    #>
+    param([string]$Spec)
+
+    $names = @($Spec -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if ($names.Count -eq 0) { throw '-ComponentList was empty. Use -Component.' }
+
+    $valid = @('AltTab', 'Windowed', 'Controller', 'All')
+    $bad   = @($names | Where-Object { $valid -notcontains $_ })
+    if ($bad.Count -gt 0) {
+        throw ("-ComponentList names $($bad -join ', '), which is not a component. " +
+               "Valid values are $($valid -join ', '). Use -Component.")
+    }
+
+    return $names
 }
 
 function Assert-ComponentOptions {
@@ -388,8 +434,22 @@ function Invoke-SelfElevate {
 
     foreach ($kv in $Bound.GetEnumerator()) {
         if ($kv.Key -in @('NoElevate', 'ElevatedRelaunch')) { continue }
-        if ($kv.Value -is [switch]) {
-            if ($kv.Value.IsPresent) { $argList += "-$($kv.Key)" }
+
+        # A list cannot be forwarded as a list: -File binds every argument as one literal
+        # string, and [string] on an array joins it with spaces, so -Component came out as
+        # the single value 'AltTab Windowed' and the elevated child died on ValidateSet.
+        # Hand it to the internal -ComponentList instead, which takes exactly one string.
+        if ($kv.Key -eq 'Component') {
+            $argList += '-ComponentList'
+            $argList += (ConvertTo-ProcessArgument ((@($kv.Value) | ForEach-Object { [string]$_ }) -join ','))
+            continue
+        }
+
+        # [bool] as well as [switch]: a choice made by the selector is recorded in this
+        # dictionary by hand, and a plain $true would otherwise be forwarded as the value
+        # of a switch - '-Revert True' - which binds as a positional argument and throws.
+        if (($kv.Value -is [switch]) -or ($kv.Value -is [bool])) {
+            if ($kv.Value) { $argList += "-$($kv.Key)" }
         }
         else {
             $argList += "-$($kv.Key)"
@@ -1712,11 +1772,166 @@ function Invoke-Revert {
 
 #endregion
 
+#region ---------------------------------------------------------------- selector
+
+function Test-CanPrompt {
+    <#
+        Whether there is somebody on the other end to ask.
+
+        A redirected or absent stdin cannot answer, and asking anyway is worse than not
+        asking: Read-Host would read EOF and spin, or block a scheduled run that expected
+        the documented defaults. In that case the selector is skipped and -Component's
+        default stands, which is exactly what every release before this one did.
+    #>
+    if (-not [Environment]::UserInteractive) { return $false }
+    try   { if ([Console]::IsInputRedirected) { return $false } }
+    catch { return $false }   # a host with no console attached at all
+    return $true
+}
+
+function Get-ComponentInstallState {
+    <#
+        Which parts are installed right now, as a name -> bool map for the selector's labels.
+
+        These are deliberately the same three checks Show-Status prints, rather than a second
+        opinion that could disagree with the status output about the same install.
+    #>
+    param([string]$Folder)
+
+    $db = $null
+    try { $db = Get-BgeShimDatabase } catch { }
+
+    return @{
+        AltTab     = [bool]($db -and $db.IsOurs)
+        Windowed   = [bool](Test-Path -LiteralPath (Join-Path $Folder 'd3d9_windowed.ini'))
+        Controller = [bool](Test-Path -LiteralPath (Join-Path $Folder 'dinput8_xinput.ini'))
+    }
+}
+
+function Show-ComponentSelector {
+    <#
+        Asks which of the three fixes to install. Returns what to do:
+
+            @{ Action = 'Install'; Components = @('AltTab', ...) }
+            @{ Action = 'Revert' }
+            @{ Action = 'Quit' }
+
+        Reached only on a bare interactive run - see the entry point - so it never changes
+        what a command line or a script asked for.
+
+        It runs BEFORE elevation, on purpose. The question is asked in the window the user is
+        looking at, and the answer is then forwarded to the elevated copy as an explicit
+        component list; asking after the UAC prompt would put the menu in a window that
+        appeared on its own, which is where people click Yes and then wonder what they agreed
+        to. It also means quitting costs nothing: no UAC prompt has been raised yet.
+
+        Toggles, not a typed list: every entry is one keystroke, an unrecognised keystroke
+        changes nothing, and the whole selection is on screen at all times. Read-Host rather
+        than a raw-key loop, because Read-Host works over a remote session, in the ISE, and
+        with the accessibility tools that a RawUI keypress loop leaves out.
+    #>
+    param([string]$Folder, [string[]]$Preselected)
+
+    $items = @(
+        [pscustomobject]@{
+            Key    = 'AltTab'
+            Title  = 'Alt+Tab fix'
+            Detail = "Drops GOG's IgnoreAltTab shim, keeps the single-core affinity one."
+        }
+        [pscustomobject]@{
+            Key    = 'Windowed'
+            Title  = 'Windowed mode'
+            Detail = 'Ends exclusive fullscreen - the reason Alt+Tab corrupted the HUD.'
+        }
+        # Key is the -Component name, never a display string: the same key indexes the
+        # install-state map and is handed to the elevated copy, so a friendlier key here
+        # would have to be mapped back in two places and would read 'not installed' for
+        # something that is.
+        [pscustomobject]@{
+            Key    = 'Controller'
+            Title  = 'Gamepad support'
+            Detail = 'XInput pads. The GOG build has no gamepad code at all.'
+        }
+    )
+
+    $state    = Get-ComponentInstallState -Folder $Folder
+    $selected = @{}
+    foreach ($item in $items) { $selected[$item.Key] = ($Preselected -contains $item.Key) }
+
+    while ($true) {
+        Write-Head 'Choose what to install'
+        Write-Host '  Three independent fixes. Type a number to turn one on or off.' -ForegroundColor DarkGray
+        Write-Host '  Leaving one off leaves it as it is - off does not mean remove.' -ForegroundColor DarkGray
+        Write-Host ''
+
+        for ($i = 0; $i -lt $items.Count; $i++) {
+            $item = $items[$i]
+            $on   = $selected[$item.Key]
+            Write-Host ("   [{0}] {1}  {2,-17}" -f $(if ($on) { 'x' } else { ' ' }), ($i + 1), $item.Title) `
+                       -ForegroundColor $(if ($on) { 'White' } else { 'DarkGray' }) -NoNewline
+            if ($state[$item.Key]) { Write-Host 'installed already' -ForegroundColor Green }
+            else                   { Write-Host 'not installed'     -ForegroundColor DarkGray }
+            Write-Host "          $($item.Detail)" -ForegroundColor DarkGray
+        }
+
+        Write-Host ''
+        $chosen = @($items | Where-Object { $selected[$_.Key] })
+        if ($chosen.Count -gt 0) {
+            Write-Host "  Enter installs: $(($chosen | ForEach-Object { $_.Title }) -join ', ')" -ForegroundColor Cyan
+        }
+        else {
+            Write-Host '  Nothing selected.' -ForegroundColor Yellow
+        }
+        Write-Host '  1-3 toggle    A all    N none    S current state    U uninstall all    Q quit' -ForegroundColor DarkGray
+        Write-Host ''
+
+        $raw = $null
+        try   { $raw = Read-Host '  >' } catch { return @{ Action = 'Quit' } }
+        if ($null -eq $raw) { return @{ Action = 'Quit' } }
+        $answer = $raw.Trim()
+
+        if ($answer -eq '') {
+            if ($chosen.Count -eq 0) {
+                Write-Warn2 'Nothing is selected, so there is nothing to install. Q to quit.'
+                continue
+            }
+            return @{ Action = 'Install'; Components = @($chosen | ForEach-Object { $_.Key }) }
+        }
+
+        switch -Regex ($answer) {
+            '^[Qq]$' { return @{ Action = 'Quit' } }
+            '^[Aa]$' { foreach ($item in $items) { $selected[$item.Key] = $true  } }
+            '^[Nn]$' { foreach ($item in $items) { $selected[$item.Key] = $false } }
+            '^[Ss]$' { Show-Status -Folder $Folder }
+            '^[Uu]$' {
+                Write-Host ''
+                Write-Warn2 'This removes all three fixes and restores GOG''s original shim database.'
+                $confirm = $null
+                try { $confirm = Read-Host '  Remove everything? [y/N]' } catch { }
+                if ($confirm -match '^(?i:y|yes)$') { return @{ Action = 'Revert' } }
+                Write-Info 'Left alone.'
+            }
+            '^[1-3][\s,1-3]*$' {
+                foreach ($ch in $answer.ToCharArray()) {
+                    if ($ch -notmatch '[1-3]') { continue }
+                    $item = $items[[int]::Parse($ch) - 1]
+                    $selected[$item.Key] = -not $selected[$item.Key]
+                }
+            }
+            default {
+                Write-Warn2 "'$answer' is not one of the choices. Nothing changed."
+            }
+        }
+    }
+}
+
+#endregion
+
 #region ---------------------------------------------------------------- entry point
 
 try {
     Write-Host ''
-    Write-Host "  $script:AppName" -ForegroundColor White
+    Write-Host "  $script:AppName $script:AppVersion" -ForegroundColor White
     Write-Host '  Fixes for the GOG release of Beyond Good & Evil (2003)' -ForegroundColor DarkGray
 
     $folder = Resolve-GameFolder -Explicit $GamePath
@@ -1728,8 +1943,47 @@ try {
         return
     }
 
+    # The elevated copy is handed its component list as one string, because a list cannot
+    # survive -File. Turn it back into -Component before anything reads either, and record it
+    # as bound so the rest of the script cannot tell the difference.
+    if ($ComponentList) {
+        $Component = Resolve-ComponentSpec -Spec $ComponentList
+        $PSBoundParameters['Component'] = $Component
+        $PSBoundParameters.Remove('ComponentList') | Out-Null
+    }
+
+    # A bare interactive run - the double-click case - asks what to install instead of
+    # assuming. One bound parameter, any bound parameter, and the caller has already said
+    # what they want, so the selector stays out of the way: -Force, -WhatIf, -Component and
+    # every scripted invocation behave exactly as documented, and so does the elevated
+    # relaunch, which always arrives with at least -ElevatedRelaunch bound.
+    if ($PSBoundParameters.Count -eq 0 -and (Test-CanPrompt)) {
+        $choice = Show-ComponentSelector -Folder $folder -Preselected (Resolve-Components)
+
+        if ($choice.Action -eq 'Quit') {
+            Write-Host ''
+            Write-Info 'Nothing was changed.'
+            Write-Host ''
+            return
+        }
+
+        # Record the answer as though it had been typed on the command line. Invoke-SelfElevate
+        # rebuilds the elevated command line from $PSBoundParameters, so a choice that is not
+        # written back here would be re-derived from the defaults in the elevated window.
+        if ($choice.Action -eq 'Revert') {
+            $Revert = [switch]$true
+            $PSBoundParameters['Revert'] = $Revert
+        }
+        else {
+            $Component = $choice.Components
+            $PSBoundParameters['Component'] = $Component
+        }
+    }
+
     $components = Resolve-Components -Requested $Component -ForRevert:$Revert
-    if ($PSCmdlet.ParameterSetName -ne 'Revert') {
+    # Not the parameter set name: the selector's uninstall sets -Revert from inside the Apply
+    # set, and this gate is about what the run is doing, not how it was asked for.
+    if (-not $Revert) {
         Assert-ComponentOptions -Components $components -Bound $PSBoundParameters
     }
 

@@ -33,7 +33,8 @@ New-Item -ItemType Directory -Path $tmp | Out-Null
 # --- lift the functions and marker constants out of the installer -------------------
 $ast  = [System.Management.Automation.Language.Parser]::ParseFile($src, [ref]$null, [ref]$null)
 $want = 'ConvertTo-ProcessArgument', 'Invoke-SelfElevate',
-        'Resolve-Components', 'Assert-ComponentOptions',
+        'Resolve-Components', 'Assert-ComponentOptions', 'Resolve-ComponentSpec',
+        'Test-CanPrompt', 'Get-ComponentInstallState', 'Show-ComponentSelector',
         'Test-Pe32', 'Get-ProxyMarkerVersion', 'Test-IsOurProxy',
         'Initialize-SdbApi', 'Get-SdbTagString', 'Get-SdbChildString', 'Get-SdbContents',
         'Get-SdbNodes', 'New-AffinityOnlySdb', 'Read-SdbRawString',
@@ -535,6 +536,52 @@ public static extern IntPtr LocalFree(IntPtr hMem);
           ($gp -ge 0 -and (@(Get-ParsedArgs -CommandLine ('x.exe ' + $args[$gp+1]))[1]) -eq 'D:\Games\BGE\') `
           $(if ($gp -ge 0) { $args[$gp+1] } else { 'absent' })
 
+    # A multi-valued -Component cannot cross the UAC boundary as a list: powershell.exe -File
+    # binds every argument as one literal string. It used to be forwarded as -Component with
+    # [string] applied to the array, i.e. 'AltTab Windowed', so the elevated child failed
+    # ValidateSet - in its own window, after the parent had printed the plan.
+    $script:capturedArgs = $null
+    $null = Invoke-SelfElevate -Bound @{ Component = @('AltTab', 'Windowed') } 6>&1
+    $args2 = @($script:capturedArgs)
+    $cl = [array]::IndexOf($args2, '-ComponentList')
+    Check 'a component list is forwarded as one string, not as -Component' `
+          (($cl -ge 0) -and -not ($args2 -contains '-Component')) `
+          ("forwarded: $($args2 -join ' ')")
+    Check 'the forwarded list keeps both components' `
+          ($cl -ge 0 -and (@(Get-ParsedArgs -CommandLine ('x.exe ' + $args2[$cl+1]))[1]) -eq 'AltTab,Windowed') `
+          $(if ($cl -ge 0) { $args2[$cl+1] } else { 'absent' })
+
+    # Round trip: what the parent sends, the child must accept. Asserted by really running it.
+    $savedEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $null = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'Fix-BGE.ps1') `
+                    -ComponentList 'AltTab,Windowed' -WhatIf 2>&1
+        $childCode = $LASTEXITCODE
+        # And confirm the test is not vacuous: the form this replaced really is rejected.
+        $null = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'Fix-BGE.ps1') `
+                    -Component 'AltTab Windowed' -WhatIf 2>&1
+        $naiveCode = $LASTEXITCODE
+    }
+    finally { $ErrorActionPreference = $savedEap }
+
+    Check 'the elevated child accepts the forwarded component list' ($childCode -eq 0) "exit $childCode"
+    Check 'the space-joined form this replaced is genuinely rejected' ($naiveCode -ne 0) "exit $naiveCode"
+
+    Check '-ComponentList splits back into a component list' `
+          ((@(Resolve-ComponentSpec -Spec 'AltTab,Windowed') -join '|') -eq 'AltTab|Windowed') `
+          (@(Resolve-ComponentSpec -Spec 'AltTab,Windowed') -join '|')
+    Check '-ComponentList tolerates the spacing a human would add' `
+          ((@(Resolve-ComponentSpec -Spec ' AltTab , Controller ') -join '|') -eq 'AltTab|Controller') ''
+
+    $threw = $false
+    try { Resolve-ComponentSpec -Spec 'AltTab,Nonsense' } catch { $threw = $true }
+    Check '-ComponentList rejects a name that is not a component' $threw ''
+
+    $threw = $false
+    try { Resolve-ComponentSpec -Spec ',,' } catch { $threw = $true }
+    Check '-ComponentList rejects an empty list' $threw ''
+
     # ---------------------------------------------------------------- component model
     Write-Host ''
     Write-Host '  -- component selection --'
@@ -564,6 +611,109 @@ public static extern IntPtr LocalFree(IntPtr hMem);
     try { Assert-ComponentOptions -Components @('Windowed', 'Controller') -Bound @{ WindowMode = 2; PadLookSpeed = 900 } }
     catch { $ok = $false }
     Check 'tuning is accepted when its component is selected' $ok ''
+
+    # ---------------------------------------------------------------- the selector
+    Write-Host ''
+    Write-Host '  -- the interactive selector --'
+
+    # Read-Host is stubbed with a queue of answers: a function beats the cmdlet in name
+    # resolution, so the REAL selector runs here - drawing, looping and toggling exactly as
+    # it does for a user. The alternative was a second implementation in the test, which is
+    # the thing that drifts. Show-Status gets a counter instead of running for real; the real
+    # one is exercised earlier in this same file.
+    $script:answers     = New-Object System.Collections.Queue
+    $script:statusCalls = 0
+    function Read-Host {
+        param([string]$Prompt)
+        if ($script:answers.Count -eq 0) {
+            throw 'the selector asked more questions than the test had answers for'
+        }
+        return $script:answers.Dequeue()
+    }
+    function Show-Status { param([string]$Folder) $script:statusCalls++ }
+    function Get-BgeShimDatabase { return $null }
+
+    function Invoke-Selector {
+        param([string[]]$Keys, [string[]]$Preselected = @('AltTab', 'Windowed'))
+        $script:answers = New-Object System.Collections.Queue
+        foreach ($k in $Keys) { $script:answers.Enqueue($k) }
+        return (Show-ComponentSelector -Folder $tmp -Preselected $Preselected 6>$null)
+    }
+
+    $r = Invoke-Selector -Keys @('')
+    Check 'Enter installs the preselected default' `
+          ($r.Action -eq 'Install' -and (@($r.Components) -join ',') -eq 'AltTab,Windowed') `
+          ("$($r.Action): $(@($r.Components) -join ',')")
+
+    $r = Invoke-Selector -Keys @('3', '')
+    Check 'a number turns its fix on' `
+          ((@($r.Components) -join ',') -eq 'AltTab,Windowed,Controller') (@($r.Components) -join ',')
+
+    $r = Invoke-Selector -Keys @('13', '')
+    Check 'several numbers at once each toggle' `
+          ((@($r.Components) -join ',') -eq 'Windowed,Controller') (@($r.Components) -join ',')
+
+    $r = Invoke-Selector -Keys @('a', '')
+    Check 'A selects all three' ((@($r.Components) -join ',') -eq 'AltTab,Windowed,Controller') ''
+
+    # The one outcome that must be impossible: an install that was asked for and does nothing.
+    $r = Invoke-Selector -Keys @('n', '', 'q')
+    Check 'an empty selection cannot be installed' ($r.Action -eq 'Quit') $r.Action
+
+    $r = Invoke-Selector -Keys @('q')
+    Check 'Q quits without installing anything' ($r.Action -eq 'Quit') $r.Action
+
+    $r = Invoke-Selector -Keys @('u', 'y')
+    Check 'U asks, and a yes returns a revert' ($r.Action -eq 'Revert') $r.Action
+
+    $r = Invoke-Selector -Keys @('u', 'n', 'q')
+    Check 'U does nothing without a yes' ($r.Action -eq 'Quit') $r.Action
+
+    $script:statusCalls = 0
+    $r = Invoke-Selector -Keys @('s', '')
+    Check 'S shows the current state and keeps the selection' `
+          ($script:statusCalls -eq 1 -and (@($r.Components) -join ',') -eq 'AltTab,Windowed') `
+          "status calls: $script:statusCalls"
+
+    $r = Invoke-Selector -Keys @('x', '')
+    Check 'an unrecognised answer changes nothing' `
+          ((@($r.Components) -join ',') -eq 'AltTab,Windowed') (@($r.Components) -join ',')
+
+    # Every key the selector returns has to be a name -Component accepts, or the choice dies
+    # at the elevation boundary instead of installing.
+    $r = Invoke-Selector -Keys @('a', '')
+    $declaredSet = (Get-Command (Join-Path $repo 'Fix-BGE.ps1')).Parameters['Component'].Attributes |
+                   Where-Object { $_ -is [System.Management.Automation.ValidateSetAttribute] }
+    $validNames = @($declaredSet.ValidValues)
+    $unknown = @(@($r.Components) | Where-Object { $validNames -notcontains $_ })
+    Check 'the selector only returns names -Component accepts' (@($unknown).Count -eq 0) `
+          $(if (@($unknown).Count) { "not accepted: $($unknown -join ', ')" } else { $validNames -join ',' })
+
+    # The promise that keeps unattended runs working: no console on the other end means no
+    # question. Asserted in a child process with a genuinely redirected stdin, because in this
+    # one the answer depends on how the suite itself was started - from a real console it is
+    # legitimately $true, so asserting on the harness's own stdin would fail for a developer
+    # and pass in CI, which is the wrong way round.
+    $probePath = Join-Path $tmp 'canprompt.ps1'
+    Set-Content -LiteralPath $probePath -Value @(
+        "`$ast = [System.Management.Automation.Language.Parser]::ParseFile('$src', [ref]`$null, [ref]`$null)"
+        "`$f = `$ast.FindAll({ param(`$n) `$n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and `$n.Name -eq 'Test-CanPrompt' }, `$true)"
+        ". ([scriptblock]::Create(`$f[0].Extent.Text))"
+        "'CANPROMPT=' + (Test-CanPrompt)"
+    )
+    $probeOut = (& cmd /c "powershell -NoProfile -ExecutionPolicy Bypass -File ""$probePath"" < NUL" 2>&1) | Out-String
+    Check 'a redirected stdin is never asked a question' ($probeOut -match 'CANPROMPT=False') $probeOut.Trim()
+
+    # The labels come from the same files Show-Status reads, so they cannot disagree with it.
+    $probe = Join-Path $tmp 'stateprobe'
+    New-Item -ItemType Directory -Path $probe | Out-Null
+    $st = Get-ComponentInstallState -Folder $probe
+    Check 'a clean folder reports nothing installed' `
+          ((-not $st.AltTab) -and (-not $st.Windowed) -and (-not $st.Controller)) ''
+    Set-Content -LiteralPath (Join-Path $probe 'd3d9_windowed.ini')  -Value 'Mode=1'
+    Set-Content -LiteralPath (Join-Path $probe 'dinput8_xinput.ini') -Value 'LookSpeed=1800'
+    $st = Get-ComponentInstallState -Folder $probe
+    Check 'an installed proxy is reported as installed' ($st.Windowed -and $st.Controller) ''
 
     # ---------------------------------------------------------------- parameter sets
     Write-Host ''
